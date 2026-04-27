@@ -1,5 +1,45 @@
 package burp;
 
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Font;
+import java.awt.GridLayout;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import javax.swing.JButton;
+import javax.swing.JCheckBox;
+import javax.swing.JLabel;
+import javax.swing.JMenuItem;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.JSplitPane;
+import javax.swing.JTabbedPane;
+import javax.swing.JTable;
+import javax.swing.JTextArea;
+import javax.swing.JTextField;
+import javax.swing.SwingUtilities;
+import javax.swing.table.AbstractTableModel;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.TableModel;
+
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.ToolType;
@@ -20,23 +60,6 @@ import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
-
-import javax.swing.*;
-import javax.swing.table.AbstractTableModel;
-import javax.swing.table.DefaultTableCellRenderer;
-import javax.swing.table.TableModel;
-import java.awt.*;
-import java.io.*;
-import java.lang.reflect.Method;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class BurpExtender implements BurpExtension {
 
@@ -67,7 +90,7 @@ public class BurpExtender implements BurpExtension {
     private int    diyPayload2    = 0;
     private Table  logTable;
     private int    isCookie       = -1;
-    private String whiteUrl       = "";
+    private String whiteUrl       = "*";
     private int    whiteSwitchs   = 0;
     private volatile int requestIntervalMs = 0;
     private final AtomicLong lastSendAt = new AtomicLong(0);
@@ -253,7 +276,7 @@ public class BurpExtender implements BurpExtension {
         JCheckBox chkbox3 = new JCheckBox("监控Proxy");
         JCheckBox chkbox4 = new JCheckBox("值是数字则进行-1、-0", true);
         JCheckBox chkbox8 = new JCheckBox("测试Cookie");
-        JTextField textField = new JTextField("填写白名单域名");
+        JTextField textField = new JTextField("*");
         JTextField intervalField = new JTextField("发包间隔毫秒(默认0)");
         JButton btn1 = new JButton("清空列表");
         JButton btn3 = new JButton("启动白名单");
@@ -268,7 +291,7 @@ public class BurpExtender implements BurpExtension {
         ctrlPanel.add(intervalField);
         ctrlPanel.add(btnInterval);
         ctrlPanel.add(btn1);
-        ctrlPanel.add(new JLabel("如果需要多个域名加白请用,隔开"));
+        ctrlPanel.add(new JLabel("白名单目标支持逗号分隔，例如 *.baidu.com"));
         ctrlPanel.add(textField);
         ctrlPanel.add(btn3);
 
@@ -420,18 +443,23 @@ public class BurpExtender implements BurpExtension {
             } catch (IOException ignored) {}
             stdout.println("payload 已加载");
         });
+        textField.setEditable(true);
+        textField.setForeground(Color.BLACK);
         btn3.addActionListener(e -> {
             if (btn3.getText().equals("启动白名单")) {
                 btn3.setText("关闭白名单");
-                whiteUrl = textField.getText();
+                whiteUrl = textField.getText() == null ? "*" : textField.getText().trim();
+                if (whiteUrl.isEmpty()) whiteUrl = "*";
                 whiteSwitchs = 1;
                 textField.setEditable(false);
                 textField.setForeground(Color.GRAY);
+                stdout.println("已启用白名单: " + whiteUrl);
             } else {
                 btn3.setText("启动白名单");
                 whiteSwitchs = 0;
                 textField.setEditable(true);
                 textField.setForeground(Color.BLACK);
+                stdout.println("已关闭白名单");
             }
         });
         btnInterval.addActionListener(e -> {
@@ -465,17 +493,17 @@ public class BurpExtender implements BurpExtension {
         HttpRequest  req  = baseRequestResponse.request();
         HttpResponse resp = baseRequestResponse.response();
         String scanId = "RID-" + System.nanoTime();
+        String requestHost = extractHost(req.url().toString());
 
         List<ParsedHttpParameter> paraLists = req.parameters();
         String requestBase = req.url().toString().split("\\?")[0];
 
         // 白名单过滤
         if (whiteSwitchs == 1) {
-            boolean match = false;
-            for (String domain : whiteUrl.split(",")) {
-                if (requestBase.contains(domain.trim())) { match = true; break; }
+            if (!isWhitelistedHost(requestHost, whiteUrl)) {
+                appendLog("不是白名单目标 host=" + requestHost + " url=" + requestBase);
+                return;
             }
-            if (!match) { appendLog("不是白名单URL：" + requestBase); return; }
         }
 
         // 静态文件过滤
@@ -1013,6 +1041,48 @@ public class BurpExtender implements BurpExtension {
 
     private HttpRequestResponse buildDisplayMessage(HttpRequest sentRequest, HttpRequestResponse actualResult) {
         return HttpRequestResponse.httpRequestResponse(sentRequest, actualResult.response());
+    }
+
+    private String extractHost(String url) {
+        try {
+            URI uri = URI.create(url);
+            String h = uri.getHost();
+            if (h != null && !h.trim().isEmpty()) return h.toLowerCase();
+        } catch (Exception ignored) {}
+        try {
+            String u = url;
+            int schemeIdx = u.indexOf("://");
+            if (schemeIdx >= 0) u = u.substring(schemeIdx + 3);
+            int slash = u.indexOf('/');
+            if (slash >= 0) u = u.substring(0, slash);
+            int colon = u.indexOf(':');
+            if (colon >= 0) u = u.substring(0, colon);
+            return u.toLowerCase();
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private boolean isWhitelistedHost(String host, String rules) {
+        String h = host == null ? "" : host.trim().toLowerCase();
+        if (h.isEmpty()) return false;
+        if (rules == null || rules.trim().isEmpty()) return true;
+
+        for (String raw : rules.split(",")) {
+            String rule = raw.trim().toLowerCase();
+            if (rule.isEmpty()) continue;
+            if (matchesWhiteRule(h, rule)) return true;
+        }
+        return false;
+    }
+
+    private boolean matchesWhiteRule(String host, String rule) {
+        if ("*".equals(rule) || "all".equals(rule)) return true;
+        if (rule.startsWith("*.")) {
+            String root = rule.substring(2);
+            return host.equals(root) || host.endsWith("." + root);
+        }
+        return host.equals(rule);
     }
 
     private LogEntry addDetailEntry(LogEntry entry) {
