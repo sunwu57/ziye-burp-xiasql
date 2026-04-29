@@ -717,11 +717,13 @@ public class BurpExtender implements BurpExtension {
                     commaEntries.add(detail);
                 }
 
-                boolean cCond1 = Math.abs(commaLens[2] - commaLens[0]) < 6;
-                boolean cCond2 = Math.abs(commaLens[0] - commaLens[1]) >= 6;
+                int commaDiff01 = Math.abs(commaLens[2] - commaLens[0]);
+                int commaDiff0x = Math.abs(commaLens[0] - commaLens[1]);
+                boolean cCond1 = commaDiff01 < 6;
+                boolean cCond2 = commaDiff0x >= 6 && commaDiff0x != 10 && commaDiff0x != 15;
                 commaVuln = cCond1 && cCond2;
-                appendLog(String.format("  逗号判定 [%s] cond1(|,1-,0|<6)=%s cond2(|,0-,xxxxxx|>=6)=%s result=%s",
-                        key, cCond1, cCond2, commaVuln));
+                appendLog(String.format("  逗号判定 [%s] cond1(|,1-,0|<6)=%s cond2(|,0-,xxxxxx|>=6 且!=10 且!=15)=%s diff01=%d diff0x=%d result=%s",
+                        key, cCond1, cCond2, commaDiff01, commaDiff0x, commaVuln));
 
                 appendLog(String.format("  逗号测试 [%s] len(base=%d, ,0=%d, ,xxxxxx=%d, ,1=%d)",
                         key, baseRespLen, commaLens[0], commaLens[1], commaLens[2]));
