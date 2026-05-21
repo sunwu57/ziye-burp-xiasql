@@ -600,6 +600,7 @@ public class BurpExtender implements BurpExtension {
             List<LogEntry> divEntries = new ArrayList<>();
             List<LogEntry> sleepEntries = new ArrayList<>();
             List<LogEntry> diyEntries = new ArrayList<>();
+            List<LogEntry> fuzzyEntries = new ArrayList<>();
 
             // ================================================================
             // 新注入判断逻辑：发送 1~4 个单引号，根据响应长度规律判断注入
@@ -867,6 +868,102 @@ public class BurpExtender implements BurpExtension {
             boolean expVuln = false;
             boolean divVuln = false;
             boolean sleepVuln = false;
+            boolean fuzzyVuln = false;
+
+            // 模糊查询注入检测：
+            // poc1: value'                  -> 与原始响应长度差异 > 10
+            // poc2: value'+or+1=1--+        -> 与原始响应相似度 > 0.90
+            // poc3: value'+or+1=2--+        -> 与原始响应相似度 < 0.90
+            {
+                String baseBody = resp.bodyToString();
+                int baseLen = baseRespLen;
+
+                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
+                    String poc1Value = value + "'";
+                    HttpRequest poc1Req = buildMutatedRequest(req, para, poc1Value);
+                    long t1 = System.currentTimeMillis();
+                    HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
+                    long cost1 = System.currentTimeMillis() - t1;
+                    sentRequests++;
+                    if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                    HttpResponse poc1Resp = poc1Result.response();
+                    boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
+                    if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
+
+                    int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
+                    HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
+                    LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
+                            poc1Req.url().toString(),
+                            key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
+                    paramEntries.add(poc1Entry);
+                    fuzzyEntries.add(poc1Entry);
+
+                    int poc1Len = poc1Ok ? poc1Resp.body().length() : 0;
+                    int lenDiff = Math.abs(poc1Len - baseLen);
+                    boolean poc1Hit = poc1Ok && lenDiff > 10;
+                    appendLog(String.format("  模糊查询测试 [%s] poc1=value' len(base=%d, poc1=%d, diff=%d) result=%s",
+                            key, baseLen, poc1Len, lenDiff, poc1Hit));
+
+                    if (poc1Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
+                        String poc2Value = value + "'+or+1=1--+";
+                        HttpRequest poc2Req = buildMutatedRequest(req, para, poc2Value);
+                        long t2 = System.currentTimeMillis();
+                        HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
+                        long cost2 = System.currentTimeMillis() - t2;
+                        sentRequests++;
+                        if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                        HttpResponse poc2Resp = poc2Result.response();
+                        boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
+                        if (poc2Ok && cost2 < quickBaselineCost) quickBaselineCost = cost2;
+
+                        int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
+                        HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
+                        LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
+                                poc2Req.url().toString(),
+                                key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
+                        paramEntries.add(poc2Entry);
+                        fuzzyEntries.add(poc2Entry);
+
+                        double simBasePoc2 = 0.0;
+                        boolean poc2Hit = false;
+                        if (poc2Ok) {
+                            simBasePoc2 = textSimilarity(baseBody, poc2Resp.bodyToString());
+                            poc2Hit = simBasePoc2 > 0.90;
+                        }
+                        appendLog(String.format("  模糊查询测试 [%s] poc2=value'+or+1=1--+ sim(base,poc2)=%.4f result=%s",
+                                key, simBasePoc2, poc2Hit));
+
+                        if (poc2Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
+                            String poc3Value = value + "'+or+1=2--+";
+                            HttpRequest poc3Req = buildMutatedRequest(req, para, poc3Value);
+                            long t3 = System.currentTimeMillis();
+                            HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
+                            long cost3 = System.currentTimeMillis() - t3;
+                            sentRequests++;
+                            if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                            HttpResponse poc3Resp = poc3Result.response();
+                            boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
+                            if (poc3Ok && cost3 < quickBaselineCost) quickBaselineCost = cost3;
+
+                            int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
+                            HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
+                            LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
+                                    poc3Req.url().toString(),
+                                    key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
+                            paramEntries.add(poc3Entry);
+                            fuzzyEntries.add(poc3Entry);
+
+                            double simBasePoc3 = 0.0;
+                            if (poc3Ok) {
+                                simBasePoc3 = textSimilarity(baseBody, poc3Resp.bodyToString());
+                                fuzzyVuln = simBasePoc3 < 0.90;
+                            }
+                            appendLog(String.format("  模糊查询测试 [%s] poc3=value'+or+1=2--+ sim(base,poc3)=%.4f result=%s",
+                                    key, simBasePoc3, fuzzyVuln));
+                        }
+                    }
+                }
+            }
 
             // 报错注入检测（对四个 payload 的响应逐一检测）
             boolean errorVuln = false;
@@ -892,7 +989,7 @@ public class BurpExtender implements BurpExtension {
             }
 
             // 分级检测：快速规则命中后，跳过重型规则(exp/div/sleep)
-            boolean fastRuleHit = quoteVuln || numVuln || commaVuln || errorVuln;
+            boolean fastRuleHit = quoteVuln || numVuln || commaVuln || fuzzyVuln || errorVuln;
             if (!fastRuleHit && !slowDetected && sentRequests < MAX_REQUESTS_PER_PARAM) {
                 // Oracle exp 检测：'||exp(200)||' / '||exp(11111)||'
                 String[] expPayloads = {"'||exp(200)||'", "'||exp(11111)||'"};
@@ -1049,7 +1146,7 @@ public class BurpExtender implements BurpExtension {
             }
 
             // ── 汇总当前参数结论 ────────────────────────────
-            boolean paramVuln = quoteVuln || numVuln || commaVuln || expVuln || divVuln || sleepVuln || errorVuln || diyVuln;
+            boolean paramVuln = quoteVuln || numVuln || commaVuln || fuzzyVuln || expVuln || divVuln || sleepVuln || errorVuln || diyVuln;
             List<String> triggeredSigns = new ArrayList<>();
             if (quoteVuln) {
                 triggeredSigns.add("✔ 单引号拼接注入");
@@ -1063,6 +1160,10 @@ public class BurpExtender implements BurpExtension {
             if (commaVuln) {
                 triggeredSigns.add("✔ order注入");
                 appendLog("【order注入】参数:" + key + " 触发逗号四步 Jaccard 规则");
+            }
+            if (fuzzyVuln) {
+                triggeredSigns.add("✔ 模糊查询注入");
+                appendLog("【模糊查询注入】参数:" + key + " 触发 value' -> or 1=1 -> or 1=2 规则");
             }
             if (expVuln) {
                 triggeredSigns.add("✔ 表达式注入(exp)");
@@ -1091,6 +1192,7 @@ public class BurpExtender implements BurpExtension {
                 if (quoteVuln) markEntries(quoteEntries, "✔ 单引号拼接注入");
                 if (numVuln) markEntries(numEntries, "✔ 数字型注入");
                 if (commaVuln) markEntries(commaEntries, "✔ order注入");
+                if (fuzzyVuln) markEntries(fuzzyEntries, "✔ 模糊查询注入");
                 if (expVuln) markEntries(expEntries, "✔ 表达式注入(exp)");
                 if (divVuln) markEntries(divEntries, "✔ 表达式注入(除零)");
                 if (sleepVuln) markEntries(sleepEntries, "✔ 延时注入(sleep)");
