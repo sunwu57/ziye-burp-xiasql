@@ -924,16 +924,7 @@ public class BurpExtender implements BurpExtension {
                         paramEntries.add(poc2Entry);
                         fuzzyEntries.add(poc2Entry);
 
-                        double simBasePoc2 = 0.0;
-                        boolean poc2Hit = false;
-                        if (poc2Ok) {
-                            simBasePoc2 = textSimilarity(baseBody, poc2Resp.bodyToString());
-                            poc2Hit = simBasePoc2 > 0.90;
-                        }
-                        appendLog(String.format("  模糊查询测试 [%s] poc2=value'+or+1=1--+ sim(base,poc2)=%.4f result=%s",
-                                key, simBasePoc2, poc2Hit));
-
-                        if (poc2Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
+                        if (sentRequests < MAX_REQUESTS_PER_PARAM) {
                             String poc3Value = value + "'+or+1=2--+";
                             HttpRequest poc3Req = buildMutatedRequest(req, para, poc3Value);
                             long t3 = System.currentTimeMillis();
@@ -953,13 +944,13 @@ public class BurpExtender implements BurpExtension {
                             paramEntries.add(poc3Entry);
                             fuzzyEntries.add(poc3Entry);
 
-                            double simBasePoc3 = 0.0;
-                            if (poc3Ok) {
-                                simBasePoc3 = textSimilarity(baseBody, poc3Resp.bodyToString());
-                                fuzzyVuln = simBasePoc3 < 0.90;
+                            double simPoc2Poc3 = 1.0;
+                            if (poc2Ok && poc3Ok) {
+                                simPoc2Poc3 = textSimilarity(poc2Resp.bodyToString(), poc3Resp.bodyToString());
+                                fuzzyVuln = simPoc2Poc3 < 0.90;
                             }
-                            appendLog(String.format("  模糊查询测试 [%s] poc3=value'+or+1=2--+ sim(base,poc3)=%.4f result=%s",
-                                    key, simBasePoc3, fuzzyVuln));
+                            appendLog(String.format("  模糊查询测试 [%s] sim(poc2,poc3)=%.4f result=%s",
+                                    key, simPoc2Poc3, fuzzyVuln));
                         }
                     }
                 }
