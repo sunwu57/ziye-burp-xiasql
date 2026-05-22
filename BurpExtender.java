@@ -13,10 +13,10 @@ import java.io.PrintWriter;
 import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -54,8 +54,8 @@ import burp.api.montoya.http.handler.HttpRequestToBeSent;
 import burp.api.montoya.http.handler.HttpResponseReceived;
 import burp.api.montoya.http.handler.RequestToBeSentAction;
 import burp.api.montoya.http.handler.ResponseReceivedAction;
-import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
 import burp.api.montoya.http.message.params.ParsedHttpParameter;
@@ -902,8 +902,8 @@ public class BurpExtender implements BurpExtension {
 
             // 反引号注入检测：
             // poc1: value`                    -> 与原始响应体长度差 > 10
-            // poc2: value`and+sleep(2)--+     -> 与原始响应时间差 >= 2s
-            // poc3: value`and+sleep(5)--+     -> 与原始响应时间差 < 4s (命中)
+            // poc2: value`and+sleep(2)--+     -> 与原始响应时间差 > 2s 且 < 4s
+            // poc3: value`and+sleep(5)--+     -> 与原始响应时间差 > 4s 且 < 6s (命中)
             {
                 int baseLen = baseRespLen;
                 long baseCostMs = (quickBaselineCost == Long.MAX_VALUE) ? 0 : quickBaselineCost;
@@ -954,7 +954,7 @@ public class BurpExtender implements BurpExtension {
                         backtickEntries.add(poc2Entry);
 
                         long diff2 = cost2 - baseCostMs;
-                        boolean poc2Hit = poc2Ok && diff2 >= 2000;
+                        boolean poc2Hit = poc2Ok && diff2 > 2000 && diff2 < 4000;
                         appendLog(String.format("  反引号测试 [%s] poc2=value`and+sleep(2)--+ cost(base=%dms, poc2=%dms, diff=%dms) result=%s",
                                 key, baseCostMs, cost2, diff2, poc2Hit));
 
@@ -978,7 +978,7 @@ public class BurpExtender implements BurpExtension {
                             backtickEntries.add(poc3Entry);
 
                             long diff3 = cost3 - baseCostMs;
-                            backtickVuln = poc3Ok && diff3 < 6000;
+                            backtickVuln = poc3Ok && diff3 > 4000 && diff3 < 6000;
                             appendLog(String.format("  反引号测试 [%s] poc3=value`and+sleep(5)--+ cost(base=%dms, poc3=%dms, diff=%dms) result=%s",
                                     key, baseCostMs, cost3, diff3, backtickVuln));
                         }
