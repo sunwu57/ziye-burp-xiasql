@@ -85,6 +85,7 @@ public class BurpExtender implements BurpExtension {
     private final List<LogEntry>   log3    = Collections.synchronizedList(new ArrayList<>());
     private final List<RequestMd5> log4Md5 = Collections.synchronizedList(new ArrayList<>());
     private final Set<String> scannedPathValues = Collections.synchronizedSet(new HashSet<>());
+    private final Set<String> scannedHeaderNames = Collections.synchronizedSet(new HashSet<>());
 
     // ── 基础开关 ──────────────────────────────────────────────
     private int    switchs        = 1;
@@ -474,7 +475,7 @@ public class BurpExtender implements BurpExtension {
             }
         });
         btn1.addActionListener(e -> {
-            log.clear(); log2.clear(); log3.clear(); log4Md5.clear(); scannedPathValues.clear();
+            log.clear(); log2.clear(); log3.clear(); log4Md5.clear(); scannedPathValues.clear(); scannedHeaderNames.clear();
             count.set(0);
             fireTableDataChanged();
             model.fireTableDataChanged();
@@ -1786,6 +1787,7 @@ public class BurpExtender implements BurpExtension {
 
     private List<ScanTarget> buildScanTargets(HttpRequest req) {
         List<ScanTarget> targets = new ArrayList<>();
+        String hostScope = extractHost(req.url().toString());
         for (ParsedHttpParameter para : req.parameters()) {
             HttpParameterType type = para.type();
             if (type == HttpParameterType.URL || type == HttpParameterType.BODY || type == HttpParameterType.JSON) {
@@ -1798,19 +1800,26 @@ public class BurpExtender implements BurpExtension {
                 String name = header.name();
                 String value = header.value();
                 if (isInjectableHeader(name, value)) {
+                    String dedupKey = hostScope + "|" + name.trim().toLowerCase();
+                    synchronized (scannedHeaderNames) {
+                        if (scannedHeaderNames.contains(dedupKey)) {
+                            continue;
+                        }
+                        scannedHeaderNames.add(dedupKey);
+                    }
                     targets.add(ScanTarget.headerTarget(name, value));
                 }
             }
         }
 
         if (isPath == 2) {
-            targets.addAll(buildPathTargets(req));
+            targets.addAll(buildPathTargets(req, hostScope));
         }
 
         return targets;
     }
 
-    private List<ScanTarget> buildPathTargets(HttpRequest req) {
+    private List<ScanTarget> buildPathTargets(HttpRequest req, String hostScope) {
         List<ScanTarget> targets = new ArrayList<>();
         try {
             URI uri = URI.create(req.url().toString());
@@ -1827,7 +1836,7 @@ public class BurpExtender implements BurpExtension {
                     pathIndex++;
                     continue;
                 }
-                String dedupKey = urlDecode(trimmed).trim().toLowerCase();
+                String dedupKey = hostScope + "|" + urlDecode(trimmed).trim().toLowerCase();
                 synchronized (scannedPathValues) {
                     if (scannedPathValues.contains(dedupKey)) {
                         pathIndex++;
