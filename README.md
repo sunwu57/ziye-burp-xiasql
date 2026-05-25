@@ -33,9 +33,8 @@
 
 按 `url基础路径 + 参数名集合 + method` 计算 MD5，避免重复扫描。
 
-## 3. 单参数最大请求数与节流
+## 3. 节流
 
-- 单参数最多测试请求数：`MAX_REQUESTS_PER_PARAM = 18`
 - 全局发包间隔：默认 `100ms`，可在 UI 调整
 - 单请求慢阈值：`SINGLE_REQUEST_SLOW_MS = 4000ms`
 
@@ -131,16 +130,19 @@ payload：
 
 命中标记：`✔ 表达式注入(除零)`
 
-### 4.9 延时注入（sleep）
+### 4.9 括号模糊查询延时注入
 
-payload：`) and sleep(5) and (1=1`
+两步检测：
+
+1. `poc1 = value'` 与 `poc2 = value''`
+2. `poc3 = value')+and+sleep(5)--+`
 
 判定条件：
 
-- `cost(sleep) > 5000ms`
-- `quickBaselineCost < 2000ms`
+- `|len(value') - len(value'')| <= 5`
+- `cost(poc3) - cost(base) >= 5000ms`
 
-命中标记：`✔ 延时注入(sleep)`
+命中标记：`✔ 括号模糊查询延时注入`
 
 ### 4.10 自定义 payload 检测
 
