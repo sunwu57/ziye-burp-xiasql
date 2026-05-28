@@ -41,8 +41,9 @@
 
 ## 3. 节流
 
-- 全局发包间隔：默认 `100ms`，可在 UI 调整
 - 单请求慢阈值：`SINGLE_REQUEST_SLOW_MS = 4000ms`
+- 当前发包方式：全局并行发包 + 最大并发请求数控制
+- 最大并发请求数：默认 `8`，可在 UI 调整
 
 ## 4. 注入检测规则
 
@@ -138,15 +139,17 @@ payload：
 
 ### 4.9 括号模糊查询延时注入
 
-两步检测：
+三步检测：
 
 1. `poc1 = value'` 与 `poc2 = value''`
 2. `poc3 = value')+and+sleep(5)--+`
+3. `poc4 = value')+and+sleep(2)--+`
 
 判定条件：
 
 - `|len(value') - len(value'')| <= 5`
 - `cost(poc3) - cost(base) >= 5000ms`
+- `cost(poc3) - cost(poc4) >= 2000ms`
 
 命中标记：`✔ 括号模糊查询延时注入`
 
@@ -171,7 +174,7 @@ payload：
 
 - `测试Path`：默认开启
 - `测试Header`：默认关闭
-- 全局发包间隔：默认 `100ms`
+- 全局最大并发请求数：默认 `8`
 - Header 黑名单输入框默认值：`Connection,Accept,Accept-Language`
 
 ## 7. 结果标记与查看
