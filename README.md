@@ -6,7 +6,11 @@
 
 - URL 参数：`HttpParameterType.URL`
 - Body 参数：`HttpParameterType.BODY`
+- Multipart 参数：`HttpParameterType.MULTIPART_ATTRIBUTE`
 - JSON 参数：`HttpParameterType.JSON`
+- JSON 对象：Burp 自动解析顶层键值 + 递归提取嵌套对象/数组中的叶子值为 `$.0`、`$.1`...
+- JSON 数组：如 `["a","b","c"]`，按索引提取每个元素值，参数名 `[0]`、`[1]`...
+- XML Body：正则提取叶子元素 `<tag>text</tag>`，参数名为标签名
 - Path 段：如 `/user/path/admin` 会提取为 `path[0]=user`、`path[1]=path`、`path[2]=admin`
 - Header：仅在勾选 `测试Header` 时启用
 
@@ -43,7 +47,7 @@
 
 - 单请求慢阈值：`SINGLE_REQUEST_SLOW_MS = 4000ms`
 - 当前发包方式：全局并行发包 + 最大并发请求数控制
-- 最大并发请求数：默认 `8`，可在 UI 调整
+- 最大并发请求数：默认 `80`，可在 UI 调整
 
 ## 4. 注入检测规则
 
@@ -83,13 +87,17 @@
 
 ### 4.4 模糊查询注入
 
-三步检测：
+四步检测：
 
 1. `poc1 = value'`，要求与原始响应长度差 `> 10`
-2. `poc2 = value'+or+1=1--+`
+2. 命中则发送 `poc2 = value'+or+1=1--+`
 3. `poc3 = value'+or+1=2--+`
+4. `poc4 = value'+or+1=3--+`
 
-判定核心：`sim(poc2, poc3) < 0.90`
+判定条件：
+
+1. `|len(poc2) - len(poc3)| >= 10`
+2. `|len(poc3) - len(poc4)| <= 5`
 
 命中标记：`✔ 模糊查询注入`
 
@@ -174,7 +182,7 @@ payload：
 
 - `测试Path`：默认开启
 - `测试Header`：默认关闭
-- 全局最大并发请求数：默认 `8`
+- 全局最大并发请求数：默认 `80`
 - Header 黑名单输入框默认值：`Connection,Accept,Accept-Language`
 
 ## 7. 结果标记与查看
