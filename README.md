@@ -19,7 +19,7 @@
 黑名单内的 Header 不参与测试。
 
 - 内置保留黑名单：`host`、`content-length`、`transfer-encoding`
-- UI 可配置黑名单（默认）：`Connection,Accept,Accept-Language`
+- UI 可配置黑名单（默认）：`Connection,Accept,Accept-Language,Host,Content-Length,Transfer-Encoding`
 
 ### Path / Header 去重
 
@@ -81,7 +81,13 @@
 
 ### 4.3 order 注入（逗号规则）
 
-按 `value,0`、`value,1`、`value,2` 等变体组合，通过 Jaccard 相似度规则判定。
+五步检测：
+
+1. `poc1 = value,0`，`jaccard(base, poc1) < 0.90`
+2. 命中则 `poc2 = value,XXXXXX`，`jaccard(base, poc2) < 0.90` 且 `jaccard(poc1, poc2) > 0.90`
+3. 命中则 `poc3 = value,1`，`jaccard(base, poc3) > 0.90` 且 `jaccard(poc1, poc3) < 0.90`
+4. poc3 未命中则 `poc4 = value,2`，条件同 poc3
+5. poc3/poc4 命中后追加 `value,(N)`，`jaccard(pocN, paren) > 0.90`
 
 命中标记：`✔ order注入`
 
