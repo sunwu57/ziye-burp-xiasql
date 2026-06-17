@@ -117,7 +117,10 @@ public class BurpExtender implements BurpExtension {
     private volatile Set<String> customHeaderBlacklist = new HashSet<>(Set.of(
             "connection",
             "accept",
-            "accept-language"
+            "accept-language",
+            "host",
+            "content-length",
+            "transfer-encoding"
     ));
     private final AtomicInteger detailRefreshPending = new AtomicInteger(0);
 
@@ -321,7 +324,7 @@ public class BurpExtender implements BurpExtension {
         JCheckBox chkbox8 = new JCheckBox("测试Header");
         JTextField textField = new JTextField("*");
         JTextField concurrencyField = new JTextField("80");
-        JTextField headerBlacklistField = new JTextField("Connection,Accept,Accept-Language");
+        JTextField headerBlacklistField = new JTextField("Connection,Accept,Accept-Language,Host,Content-Length,Transfer-Encoding");
         JButton btn1 = new JButton("清空列表");
         JButton btn3 = new JButton("启动白名单");
         JButton btnConcurrency = new JButton("设置最大并发");
@@ -820,6 +823,8 @@ public class BurpExtender implements BurpExtension {
 
                         if (step2Ok && compareOk) {
                             boolean poc3OrPoc4Hit = false;
+                            String parenCompareBody = null;
+                            String parenPayloadSuffix = null;
 
                             {
                                 String poc3Value = value + ",1";
@@ -850,6 +855,8 @@ public class BurpExtender implements BurpExtension {
                                             key, simBasePoc3, simPoc1Poc3, poc3Hit));
                                     if (poc3Hit) {
                                         poc3OrPoc4Hit = true;
+                                        parenCompareBody = poc3Body;
+                                        parenPayloadSuffix = ",(1)";
                                     }
                                 }
                             }
@@ -883,8 +890,39 @@ public class BurpExtender implements BurpExtension {
                                             key, simBasePoc4, simPoc1Poc4, poc4Hit));
                                     if (poc4Hit) {
                                         poc3OrPoc4Hit = true;
+                                        parenCompareBody = poc4Body;
+                                        parenPayloadSuffix = ",(2)";
                                     }
                                 }
+                            }
+
+                            if (poc3OrPoc4Hit && parenCompareBody != null) {
+                                String parenValue = value + parenPayloadSuffix;
+                                HttpRequest parenReq = buildMutatedRequest(req, target, parenValue);
+                                long tparen = System.currentTimeMillis();
+                                HttpRequestResponse parenResult = sendRequestWithInterval(parenReq);
+                                long costParen = System.currentTimeMillis() - tparen;
+                                sentRequests++;
+                                if (costParen > SINGLE_REQUEST_SLOW_MS) slowDetected = true;
+                                HttpResponse parenResp = parenResult.response();
+                                boolean parenOk = (parenResp != null && parenResp.statusCode() >= 200 && parenResp.statusCode() < 300);
+                                if (parenOk && costParen < quickBaselineCost) quickBaselineCost = costParen;
+
+                                int codeParen = parenOk ? parenResp.statusCode() : 0;
+                                HttpRequestResponse parenDisplay = buildDisplayMessage(parenReq, parenResult);
+                                LogEntry parenEntry = addDetailEntry(new LogEntry(count.get(), toolFlag, parenDisplay,
+                                        parenReq.url().toString(),
+                                        key, parenValue, "", requestMd5, (int) costParen, "end", codeParen, false));
+                                paramEntries.add(parenEntry);
+                                commaEntries.add(parenEntry);
+
+                                double simParen = 0.0;
+                                if (parenOk) {
+                                    simParen = jaccardSimilarity(parenCompareBody, parenResp.bodyToString());
+                                }
+                                appendLog(String.format("  逗号测试 [%s] paren=%s sim(paren,compare)=%.4f result=%s",
+                                        key, parenValue, simParen, simParen > 0.90));
+                                poc3OrPoc4Hit = simParen > 0.90;
                             }
 
                             commaVuln = poc3OrPoc4Hit;
